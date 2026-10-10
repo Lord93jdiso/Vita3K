@@ -205,10 +205,12 @@ static shader::GeneratedShader load_shader_generic(shader::Target target, const 
     const std::string hash_text = hex_string(get_shader_hash(program));
     // Set Shader Hash with Version
     const std::string hash_hex_ver = fmt::format("{}-{}", shader_version, hash_text);
-    const auto get_shader_path = [&](const char *ext) {
+    const auto get_shader_path = [&](const std::string &ext) {
         return shader_cache_path / fmt::format("{}.{}", hash_hex_ver, ext);
     };
-    const auto get_shaderlog_path = [&](const char *ext) {
+    // Takes a std::string rather than a const char*: the dumper callback below is invoked
+    // with a std::string, and a narrow parameter here would not accept it.
+    const auto get_shaderlog_path = [&](const std::string &ext) {
         return shaderlog_path / fmt::format("{}.{}", hash_hex_ver, ext);
     };
 
