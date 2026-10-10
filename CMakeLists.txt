@@ -156,27 +156,44 @@ macro(boost_compile)
 		set(boost_stage_flags "--ignore-site-config")
 
 if(ANDROID)
-			# b2 knows nothing about the NDK, so the toolchain has to be described to it in a
-			# user-config.jam. The file cannot be produced here: jam needs its newlines as the
-			# two-character escape \n, and CMake turns a real newline into an actual line
-			# break, which jam then reads as a blank line between properties. The workflow
-			# writes this file before configuring, and this only checks that it arrived.
-			if(NOT EXISTS "${BOOST_SOURCEDIR}/user-config.jam")
-				message(FATAL_ERROR
-"Boost for Android needs a user-config.jam describing the NDK toolchain in ${BOOST_SOURCEDIR}.\n"
-"Create it with the clang++ wrapper and the NDK sysroot before configuring.")
+			# The property list is passed as one argument, so it cannot be assembled from
+			# separate CMake variables: CMake would insert unescaped semicolons and the
+			# property separators would be read as a literal. This is deliberately brittle.
+			set(boost_android_cxxflags "--sysroot=${ANDROID_NDK_HOME}/toolchains/llvm/prebuilt/linux-x86_64/sysroot")
+			set(boost_android_abi_prefix "aarch64-linux-android")
+			if(ANDROID_ABI STREQUAL "armeabi-v7a")
+				set(boost_android_arch "arm")
+				set(boost_android_abi_prefix "armv7a-linux-androideabi")
+			elseif(ANDROID_ABI STREQUAL "x86" OR ANDROID_ABI STREQUAL "x86_64")
+				set(boost_android_arch "x86")
+				set(boost_android_abi_prefix "${ANDROID_ABI}-linux-android")
+			else()
+				set(boost_android_arch "arm")
 			endif()
-			# The variant name below must match the "using clang : <variant>" line that the
-			# workflow writes: b2 exposes it as clang-<variant>.
-			set(BOOST_TOOLSET "clang-android")
-			message(STATUS "Boost: using user-config.jam (${BOOST_TOOLSET}) for ${ANDROID_ABI}")
+
+			set(BOOST_TOOLCHAIN_BIN "${ANDROID_NDK_HOME}/toolchains/llvm/prebuilt/linux-x86_64/bin")
+			file(WRITE "${BOOST_SOURCEDIR}/user-config.jam"
+"using clang : ${boost_android_arch}-android : ${BOOST_TOOLCHAIN_BIN}/${boost_android_abi_prefix}${ANDROID_API}-clang++ : <cxxflags>\"${boost_android_cxxflags}\" <arch>${boost_android_arch} <stripmt>true <linker-type>clang ;\n")
+			message(STATUS "Boost: wrote user-config.jam (${boost_android_arch}-android) for ${ANDROID_ABI}")
+			set(BOOST_TOOLSET "clang-${boost_android_arch}-android")
 		endif()
 
-		execute_process(
-			COMMAND ${b2_cmd_line_common} ${boost_stage_flags} toolset=${BOOST_TOOLSET} stage
-			WORKING_DIRECTORY ${BOOST_SOURCEDIR}
-			OUTPUT_QUIET
-		)
+		# Not silenced on Android: a toolset b2 cannot resolve produces no output and no
+		# libraries, and the failure only shows up much later as a missing Boost.
+		if(ANDROID)
+			execute_process(
+				COMMAND ${b2_cmd_line_common} ${boost_stage_flags} toolset=${BOOST_TOOLSET} stage
+				WORKING_DIRECTORY ${BOOST_SOURCEDIR}
+				RESULT_VARIABLE boost_b2_result
+			)
+			message(STATUS "Boost: b2 exited with ${boost_b2_result}")
+		else()
+			execute_process(
+				COMMAND ${b2_cmd_line_common} ${boost_stage_flags} toolset=${BOOST_TOOLSET} stage
+				WORKING_DIRECTORY ${BOOST_SOURCEDIR}
+				OUTPUT_QUIET
+			)
+		endif()
 	endif()
 endmacro(boost_compile)
 
