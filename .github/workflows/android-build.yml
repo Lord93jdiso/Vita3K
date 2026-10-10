@@ -37,6 +37,9 @@ jobs:
       - name: Install SDK packages
         run: |
           sdkmanager "platform-tools" "platforms;android-${ANDROID_API}" "ndk;${NDK_VERSION}"
+          # The NDK version is referenced by path in later steps, so a missing or unexpected
+          # path should fail here rather than deep inside cmake.
+          test -f "$ANDROID_NDK_ROOT/build/cmake/android.toolchain.cmake"
 
       - name: Set up vcpkg
         env:
@@ -52,18 +55,20 @@ jobs:
         env:
           VCPKG_LOCAL: ${{ github.workspace }}/vcpkg
         run: |
-          # cmake/vcpkg_android.cmake reads ANDROID_NDK_HOME and VCPKG_ROOT from the
-          # environment of the cmake process itself. $GITHUB_ENV only affects *later* steps,
-          # so they are exported here as well - VCPKG_ROOT already points at the clone from
-          # the previous step.
+          # The Android toolchain has to be the *primary* toolchain, not something chained
+          # behind vcpkg: cmake/vcpkg_android.cmake includes itself at the top of the root
+          # CMakeLists.txt, before project(), and the NDK toolchain is what sets
+          # CMAKE_SYSTEM_NAME to Android and picks the cross compiler. Passing vcpkg's
+          # toolchain as primary and chaining the NDK one leaves the host compiler in place
+          # and the build silently configures for Linux.
           export ANDROID_NDK_HOME="$ANDROID_NDK_ROOT"
           export VCPKG_ROOT="$VCPKG_LOCAL"
+          export VCPKG_CHAINLOAD_TOOLCHAIN_FILE="$ANDROID_NDK_ROOT/build/cmake/android.toolchain.cmake"
           cmake -B build-android -G Ninja \
-            -DCMAKE_TOOLCHAIN_FILE=cmake/vcpkg_android.cmake \
+            -DCMAKE_TOOLCHAIN_FILE="$ANDROID_NDK_ROOT/build/cmake/android.toolchain.cmake" \
             -DCMAKE_BUILD_TYPE=Release \
             -DANDROID_ABI=arm64-v8a \
-            -DANDROID_PLATFORM=android-${ANDROID_API} \
-            -DVCPKG_CHAINLOAD_TOOLCHAIN_FILE=${ANDROID_NDK_ROOT}/build/cmake/android.toolchain.cmake
+            -DANDROID_PLATFORM=android-${ANDROID_API}
 
       - name: Build
         run: cmake --build build-android --target vita3k --config Release
