@@ -63,6 +63,14 @@ private:
     void create_layout_sync();
     void create_graphics_pipeline();
 
+    // Push constants the pipeline is created with. Filters that need more than the default
+    // two floats (see the fragment shader's push_constant block) override this, and the
+    // pipeline layout is sized from it.
+    virtual std::size_t push_constants_size() const;
+
+    // Called once per draw with the same push constant block the pipeline was sized for.
+    virtual void write_push_constants(vk::CommandBuffer &cmd, const Viewport &viewport) const;
+
 protected:
     // file name inside shaders-builtin/vulkan
     virtual std::string_view get_vertex_name();
@@ -132,40 +140,25 @@ public:
     }
 };
 
-class FSRScreenFilter : public ScreenFilter {
-private:
-    // dst of the easu shader, src of the rcas shader
-    std::vector<vkutil::Image> intermediate_images;
-
-    vk::ShaderModule easu_shader;
-    vk::ShaderModule rcas_shader;
-
-    vk::DescriptorSetLayout descriptor_set_layout;
-    vk::DescriptorPool descriptor_pool;
-    std::vector<vk::DescriptorSet> descriptor_sets;
-    vk::PipelineLayout pipeline_layout_easu;
-    vk::PipelineLayout pipeline_layout_rcas;
-    vk::Pipeline pipeline_easu;
-    vk::Pipeline pipeline_rcas;
-
-    vk::Extent2D output_offset;
-    vk::Extent2D output_size;
-
-    vk::Sampler sampler;
+// FSR 1.0 as a fragment shader, for the same reason UE5 has a mobile variant: the compute
+// implementation writes the swapchain as a storage image and clears it every frame, which
+// is both expensive and unreliable on tiled mobile GPUs. As a screen filter the whole thing
+// is one rasterised pass over the destination with no swapchain manipulation at all.
+class FSRScreenFilter : public SinglePassScreenFilter {
+protected:
+    std::string_view get_fragment_name() override;
+    vk::Sampler create_sampler() override;
+    std::size_t push_constants_size() const override;
+    void write_push_constants(vk::CommandBuffer &cmd, const Viewport &viewport) const override;
 
 public:
-    FSRScreenFilter(ScreenRenderer &screen_renderer)
-        : ScreenFilter(screen_renderer) {}
-    ~FSRScreenFilter();
-    void init() override;
-    void on_resize() override;
-    void render(bool is_pre_renderpass, vk::ImageView src_img, vk::ImageLayout src_layout, const Viewport &viewport) override;
+    FSRScreenFilter(ScreenRenderer &screen)
+        : SinglePassScreenFilter(screen) {}
+
     std::string_view get_name() override {
         return "FSR";
     }
-    bool need_post_processing_render_pass() override {
-        return true;
-    }
 };
+
 
 } // namespace renderer::vulkan

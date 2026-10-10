@@ -913,8 +913,10 @@ bool VKState::create(std::unique_ptr<renderer::State> &state, const Config &conf
         LOG_WARN("Failed to initialize Vulkan overlay renderer, overlays will be disabled");
     }
 
+    // The fragment-shader FSR reads the frame through the ordinary screen-filter sampler and
+// never writes the swapchain as a storage image, so it does not need eStorage surface usage
+// - which is what used to disqualify it on drivers that only offered transfer usage.
     support_fsr = true;
-    support_fsr &= static_cast<bool>(screen_renderer.surface_capabilities.supportedUsageFlags & vk::ImageUsageFlagBits::eStorage);
 
     return true;
 }
