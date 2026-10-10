@@ -10,6 +10,10 @@ on:
 env:
   ANDROID_API: '28'
   NDK_VERSION: '27.2.12479018'
+  # The Gradle build compiles the native library itself through externalNativeBuild and
+  # packages it into an APK, so it pins its own NDK separately from the CMake-only path above.
+  GRADLE_NDK_VERSION: '29.0.14206865'
+  GRADLE_COMPILE_SDK: '35'
 
 jobs:
   android-build:
@@ -92,3 +96,51 @@ jobs:
         with:
           name: libVita3K-arm64
           path: build-android/vita3k/libVita3K.so
+
+  android-apk:
+    name: Android APK (arm64-v8a)
+    runs-on: ubuntu-24.04
+
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          submodules: recursive
+
+      - name: Install build tools
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y ninja-build cmake python3 pkg-config unzip
+
+      - name: Set up JDK
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '21'
+
+      - name: Set up the Android SDK and NDK
+        uses: android-actions/setup-android@v3
+        with:
+          # The action installs "tools" by default, which no longer exists in the SDK
+          # repository and makes the step fail before it gets to the NDK.
+          packages: ''
+
+      - name: Install SDK packages
+        run: |
+          sdkmanager "platform-tools" "platforms;android-${GRADLE_COMPILE_SDK}" \
+                    "build-tools;${GRADLE_COMPILE_SDK}.0.0" "ndk;${GRADLE_NDK_VERSION}"
+
+      - name: Build APK
+        run: |
+          # assembleRelease recompiles libVita3K.so through externalNativeBuild rather than
+          # reusing the CMake output above, which is why this is a separate job: the Gradle
+          # build drives its own CMake invocation with the NDK it pins in build.gradle.
+          cd android
+          chmod +x gradlew
+          ./gradlew --no-daemon --stacktrace :app:assembleRelease
+
+      - name: Upload APK
+        uses: actions/upload-artifact@v4
+        with:
+          name: Vita3K-arm64-apk
+          path: android/app/build/outputs/apk/release/*.apk
