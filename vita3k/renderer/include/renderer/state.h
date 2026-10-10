@@ -80,6 +80,32 @@ enum struct Filter : int {
     FSR = 1 << 4
 };
 
+// FSR 1.0 quality presets. The number is the scale factor applied to the render resolution,
+// and the render scale is what actually buys performance: FSR upscales the result back to
+// the display. A scale of 1.0 would upscale nothing and only pay for the filter.
+struct FsrQualityPreset {
+    const char *name;
+    float render_scale;
+    // RCAS sharpness: 0.0 is the sharpest, larger values soften.
+    float sharpness;
+};
+
+inline constexpr FsrQualityPreset fsr_quality_presets[] = {
+    { "Off", 1.0f, 0.0f },
+    // AMD's reference ratios for FSR 1.0, adjusted at the low end because the Vita's
+    // native frame is only 960x544 and rendering at 0.5 would be too soft to read.
+    { "Ultra Quality", 0.9167f, 0.0f },
+    { "Quality", 0.8333f, 0.2f },
+    { "Performance", 0.75f, 0.4f },
+    { "Extreme", 0.6667f, 0.6f },
+};
+
+inline constexpr int fsr_quality_mode_count = 5;
+
+inline constexpr const FsrQualityPreset &fsr_quality_preset(int mode) {
+    return fsr_quality_presets[(mode >= 0 && mode < fsr_quality_mode_count) ? mode : 0];
+}
+
 struct State {
     fs::path cache_path;
     fs::path log_path;

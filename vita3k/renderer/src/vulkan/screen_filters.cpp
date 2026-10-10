@@ -648,8 +648,8 @@ void FSRScreenFilter::render(bool is_pre_renderpass, vk::ImageView src_img, vk::
     cmd_buffer.bindDescriptorSets(vk::PipelineBindPoint::eCompute, pipeline_layout_rcas, 0, descriptor_sets[2 * screen.swapchain_image_idx + 1], {});
     RcasConstant rcas_constant{
         .offset = output_offset,
-        // some default value for sharpening
-        .sharpening = 0.2f
+        // Softer presets upscale from a lower resolution and need more sharpening to hide it.
+        .sharpening = screen.state.fsr_sharpness
     };
     cmd_buffer.pushConstants(pipeline_layout_rcas, vk::ShaderStageFlagBits::eCompute, 0, sizeof(RcasConstant), &rcas_constant);
     cmd_buffer.dispatch(dispatch_x, dispatch_y, 1);

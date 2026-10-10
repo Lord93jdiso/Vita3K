@@ -65,6 +65,11 @@ struct GLState : public renderer::State {
 
     std::string_view get_gpu_name() override;
 
+    // Without this the GL backend inherits the base implementation, which returns 0, and a
+    // cached GLSL file is reused across devices with different GL capabilities even though
+    // those capabilities change the generated shader.
+    uint32_t get_features_mask() override;
+
     void precompile_shader(const ShadersHash &hash) override;
     void preclose_action() override;
 };

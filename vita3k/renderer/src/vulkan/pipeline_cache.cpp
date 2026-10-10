@@ -225,6 +225,13 @@ void PipelineCache::init(bool support_rasterized_order_access) {
 
     support_coherent_framebuffer_fetch = support_rasterized_order_access;
 
+#ifdef __ANDROID__
+    // Mobile GPU drivers serialise pipeline compilation internally and it is CPU-bound, so
+    // the core count that suits a desktop actively hurts here: on a big.LITTLE SoC three
+    // concurrent vkCreateGraphicsPipelines calls land on the little cores and trigger
+    // thermal throttling. Two workers still overlap a driver's serial queue.
+    nb_worker_threads = 2;
+#else
     const int nb_logical_threads = SDL_GetNumLogicalCPUCores();
     // took this from RPCS3 (slightly modified)
     if (nb_logical_threads > 12)
@@ -237,6 +244,7 @@ void PipelineCache::init(bool support_rasterized_order_access) {
         nb_worker_threads = 2;
     else
         nb_worker_threads = 1;
+#endif
 
     if (use_async_compilation) {
         // we could not initialize the worker threads previously
@@ -506,7 +514,7 @@ vk::PipelineShaderStageCreateInfo PipelineCache::retrieve_shader(const SceGxmPro
     LOG_INFO("Generating vulkan spv shader {}", hash_text);
     const std::string shader_version = fmt::format("vk{}", shader::CURRENT_VERSION);
 
-    shader::usse::SpirvCode source = load_spirv_shader(*program, state.features, true, hints, maskupdate, state.shaders_path, state.shaders_log_path, shader_version, true);
+    shader::usse::SpirvCode source = load_spirv_shader(*program, state.features, true, hints, maskupdate, state.shaders_path, state.shaders_log_path, shader_version, true, state.shader_log);
 
     vk::ShaderModuleCreateInfo shader_info{
         .codeSize = sizeof(uint32_t) * source.size(),

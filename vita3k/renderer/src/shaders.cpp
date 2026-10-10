@@ -38,20 +38,38 @@ bool get_shaders_cache_hashs(State &renderer) {
     if (!shaders_hashs.is_open())
         return false;
 
-    renderer.shaders_cache_hashs.clear();
-    // Read size of hashes list
-    size_t size;
-    shaders_hashs.read((char *)&size, sizeof(size));
+    // A truncated file leaves the fields below uninitialised and the entry count garbage,
+    // which on Android is a realistic outcome (the process is killed mid-write, or the
+    // volume fills up). Everything is therefore read through a checked helper and a bad
+    // file is treated as a cache miss instead of being trusted.
+    const auto read_or_fail = [&shaders_hashs](auto &value) {
+        shaders_hashs.read(reinterpret_cast<char *>(&value), sizeof(value));
+        return shaders_hashs.gcount() == static_cast<std::streamsize>(sizeof(value));
+    };
 
-    // Check version of cache
-    uint32_t versionInFile;
-    shaders_hashs.read((char *)&versionInFile, sizeof(uint32_t));
-    uint32_t features_mask;
-    shaders_hashs.read((char *)&features_mask, sizeof(uint32_t));
-    if (versionInFile != shader::CURRENT_VERSION || features_mask != renderer.get_features_mask()) {
+    const auto discard_cache = [&renderer, &hash_file_name, &shaders_hashs](const char *reason) {
+        LOG_WARN("Shader cache '{}' is unusable ({}), recreating it.", hash_file_name, reason);
+        // Closed first: on Windows the open handle locks the file and remove_all would
+        // silently fail, leaving the corrupt cache in place.
         shaders_hashs.close();
+        renderer.shaders_cache_hashs.clear();
         fs::remove_all(renderer.shaders_path);
         fs::remove_all(renderer.shaders_log_path);
+    };
+
+    renderer.shaders_cache_hashs.clear();
+
+    size_t size = 0;
+    uint32_t versionInFile = 0;
+    uint32_t features_mask = 0;
+    if (!read_or_fail(size) || !read_or_fail(versionInFile) || !read_or_fail(features_mask)) {
+        discard_cache("truncated header");
+        return false;
+    }
+
+    if (versionInFile != shader::CURRENT_VERSION || features_mask != renderer.get_features_mask()) {
+        discard_cache(versionInFile != shader::CURRENT_VERSION ? "outdated version" : "incompatible GPU features");
+
         if (versionInFile != shader::CURRENT_VERSION)
             LOG_WARN("Current version of cache: {}, is outdated, recreate it.", versionInFile);
         else
@@ -64,21 +82,46 @@ bool get_shaders_cache_hashs(State &renderer) {
         dynamic_cast<vulkan::VKState &>(renderer).pipeline_cache.read_pipeline_cache();
     }
 
+    // Clamp against what the file can actually hold, so a corrupt count cannot be turned
+    // into a huge allocation.
+    constexpr uint64_t entry_size = sizeof(Sha256Hash) * 2;
+    constexpr uint64_t header_size = sizeof(size_t) + sizeof(uint32_t) * 2;
+
+    shaders_hashs.seekg(0, std::ios::end);
+    const std::streampos end_pos = shaders_hashs.tellg();
+    // Rewound to where the header read left off, not to zero: the entry list starts right
+    // after the header, and seeking to 0 would shift every hash by header_size bytes so no
+    // entry would ever match - the cache would silently miss on every single launch.
+    shaders_hashs.seekg(static_cast<std::streamoff>(header_size), std::ios::beg);
+    if (end_pos < 0) {
+        discard_cache("could not determine file size");
+        return false;
+    }
+    const uint64_t file_size = static_cast<uint64_t>(end_pos);
+
+    // A cache larger than this is corrupt; each entry is only 64 bytes of hash.
+    constexpr uint64_t max_cache_size = 32u * 1024u * 1024u;
+    if (file_size < header_size || file_size > max_cache_size) {
+        discard_cache("implausible file size");
+        return false;
+    }
+
+    const uint64_t max_entries = (file_size - header_size) / entry_size;
+    if (static_cast<uint64_t>(size) > max_entries) {
+        discard_cache("entry count does not match file size");
+        return false;
+    }
+
     // Read Hashs info value
+    renderer.shaders_cache_hashs.reserve(size);
     for (size_t a = 0; a < size; a++) {
-        auto read = [&shaders_hashs]() {
-            Sha256Hash hash;
+        ShadersHash hash{};
+        if (!read_or_fail(hash.frag) || !read_or_fail(hash.vert)) {
+            discard_cache("truncated hash list");
+            return false;
+        }
 
-            shaders_hashs.read(reinterpret_cast<char *>(hash.data()), sizeof(Sha256Hash));
-
-            return hash;
-        };
-
-        ShadersHash hash;
-        hash.frag = read();
-        hash.vert = read();
-
-        renderer.shaders_cache_hashs.push_back({ hash.frag, hash.vert });
+        renderer.shaders_cache_hashs.push_back(hash);
     }
 
     shaders_hashs.close();
@@ -157,7 +200,7 @@ static R load_shader_generic(const fs::path &shader_path) {
     return source;
 }
 
-static shader::GeneratedShader load_shader_generic(shader::Target target, const SceGxmProgram &program, const FeatureState &features, const shader::Hints &hints, bool maskupdate, const fs::path &shader_cache_path, const fs::path &shaderlog_path, const char *shader_type_str, const std::string &shader_version, bool shader_cache) {
+static shader::GeneratedShader load_shader_generic(shader::Target target, const SceGxmProgram &program, const FeatureState &features, const shader::Hints &hints, bool maskupdate, const fs::path &shader_cache_path, const fs::path &shaderlog_path, const char *shader_type_str, const std::string &shader_version, bool shader_cache, bool dump_shader_log) {
     // TODO: no need to recompute the hash here
     const std::string hash_text = hex_string(get_shader_hash(program));
     // Set Shader Hash with Version
@@ -185,39 +228,55 @@ static shader::GeneratedShader load_shader_generic(shader::Target target, const 
 
     LOG_INFO("Generating {} shader {}", shader_type_str, hash_text);
 
-    fs::create_directories(shaderlog_path);
+    // Every newly generated shader used to be dumped unconditionally as .gxp plus a
+    // disassembly and the GLSL source. On Android that is several megabytes per compile
+    // written to app-external storage, which is often FUSE-backed, and there was no way
+    // to turn it off. The cache itself is still written when shader_cache is enabled.
+    const bool write_shader_cache = shader_cache;
 
-    auto shader_log_path = get_shaderlog_path("gxp");
-
-    // Dump gxp binary
-    fs_utils::dump_data(shader_log_path, &program, program.size);
     const auto write_data_with_ext = [&](const std::string &ext, const std::string &data) {
-        fs::path out_path;
-        if (ext == shader_type_str) {
-            out_path = shader_path;
-        } else {
-            out_path = shader_log_path;
-            out_path.replace_extension(ext);
+        // On the GLSL path the generated source for the active type is the cache entry.
+        // The SPIR-V path has no such dumper call (its cache entry is written below), so
+        // there "frag"/"vert" is diagnostic output.
+        if (ext == shader_type_str && target == shader::Target::GLSLOpenGL && write_shader_cache) {
+            fs_utils::dump_data(shader_path, data.c_str(), data.size());
+            return true;
         }
-        fs_utils::dump_data(out_path, data.c_str(), data.size());
+
+        if (!dump_shader_log)
+            return true;
+
+        fs::create_directories(shaderlog_path);
+        // The dumper hands over short names ("dsm", "spv", "frag", "vert"); keep them as
+        // they are so a shader does not spread over one file per representation.
+        fs_utils::dump_data(get_shaderlog_path(ext), data.c_str(), data.size());
         return true;
     };
+
+    if (dump_shader_log) {
+        fs::create_directories(shaderlog_path);
+        // Dump gxp binary
+        fs_utils::dump_data(get_shaderlog_path("gxp"), &program, program.size);
+    }
 
     shader::GeneratedShader source = shader::convert_gxp(program, hash_text, features, target, hints, maskupdate, false, write_data_with_ext);
 
     // Copy shader generate to shaders cache
     const auto shaders_cache_path = fs::path(shader_cache_path);
-    fs::create_directories(shaders_cache_path);
 
-    if (target != shader::Target::GLSLOpenGL) {
-        const auto shader_dst_path = get_shader_path("spv");
-        fs_utils::dump_data(shader_dst_path, source.spirv.data(), sizeof(uint32_t) * source.spirv.size());
+    if (write_shader_cache) {
+        fs::create_directories(shaders_cache_path);
+
+        if (target != shader::Target::GLSLOpenGL) {
+            const auto shader_dst_path = get_shader_path("spv");
+            fs_utils::dump_data(shader_dst_path, source.spirv.data(), sizeof(uint32_t) * source.spirv.size());
+        }
     }
 
     return source;
 }
 
-std::string load_glsl_shader(const SceGxmProgram &program, const FeatureState &features, const shader::Hints &hints, bool maskupdate, const fs::path &shader_cache_path, const fs::path &shader_log_path, const std::string &shader_version, bool shader_cache) {
+std::string load_glsl_shader(const SceGxmProgram &program, const FeatureState &features, const shader::Hints &hints, bool maskupdate, const fs::path &shader_cache_path, const fs::path &shader_log_path, const std::string &shader_version, bool shader_cache, bool dump_shader_log) {
     SceGxmProgramType program_type = program.get_type();
 
     auto shader_type_to_str = [](SceGxmProgramType type) {
@@ -226,17 +285,17 @@ std::string load_glsl_shader(const SceGxmProgram &program, const FeatureState &f
 
     const char *shader_type_str = shader_type_to_str(program_type);
 
-    return load_shader_generic(shader::Target::GLSLOpenGL, program, features, hints, maskupdate, shader_cache_path, shader_log_path, shader_type_str, shader_version, shader_cache).glsl;
+    return load_shader_generic(shader::Target::GLSLOpenGL, program, features, hints, maskupdate, shader_cache_path, shader_log_path, shader_type_str, shader_version, shader_cache, dump_shader_log).glsl;
 }
 
-std::vector<uint32_t> load_spirv_shader(const SceGxmProgram &program, const FeatureState &features, bool is_vulkan, const shader::Hints &hints, bool maskupdate, const fs::path &shader_cache_path, const fs::path &shader_log_path, const std::string &shader_version, bool shader_cache) {
+std::vector<uint32_t> load_spirv_shader(const SceGxmProgram &program, const FeatureState &features, bool is_vulkan, const shader::Hints &hints, bool maskupdate, const fs::path &shader_cache_path, const fs::path &shader_log_path, const std::string &shader_version, bool shader_cache, bool dump_shader_log) {
     const shader::Target target = is_vulkan ? shader::Target::SpirVVulkan : shader::Target::SpirVOpenGL;
     auto shader_type_to_str = [](SceGxmProgramType type) {
         return (type == SceGxmProgramType::Vertex) ? "vert.spv.txt" : ((type == SceGxmProgramType::Fragment) ? "frag.spv.txt" : "unknown.spv.txt");
     };
     const char *shader_type_str = shader_type_to_str(program.get_type());
 
-    return load_shader_generic(target, program, features, hints, maskupdate, shader_cache_path, shader_log_path, shader_type_str, shader_version, shader_cache).spirv;
+    return load_shader_generic(target, program, features, hints, maskupdate, shader_cache_path, shader_log_path, shader_type_str, shader_version, shader_cache, dump_shader_log).spirv;
 }
 
 std::string pre_load_shader_glsl(const fs::path &shader_path) {

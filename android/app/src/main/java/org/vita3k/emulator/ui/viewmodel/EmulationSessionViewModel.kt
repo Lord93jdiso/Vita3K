@@ -36,8 +36,23 @@ data class EmulationSessionUiState(
 
 class EmulationSessionViewModel(application: Application) : AndroidViewModel(application) {
 
+    private companion object {
+        // Long enough to collapse a slider drag into a single write, short enough that the
+        // setting is durable before the user can leave the screen.
+        const val OVERLAY_PERSIST_DEBOUNCE_MS = 400L
+    }
+
     private var initialized = false
     private var useGameOverlayOverride = false
+    private var overlayPersistHandler: android.os.Handler? = null
+    private var pendingOverlayState: OverlayState? = null
+
+    // Single background thread so pause requests stay ordered relative to each other.
+    private val pauseExecutor = java.util.concurrent.Executors.newSingleThreadExecutor { runnable ->
+        Thread(runnable, "Vita3K-Pause").apply { isDaemon = true }
+    }
+
+    private val overlayPersistRunnable = Runnable { flushOverlayPersist() }
 
     var uiState by mutableStateOf(EmulationSessionUiState())
         private set
@@ -113,17 +128,21 @@ class EmulationSessionViewModel(application: Application) : AndroidViewModel(app
         emulator.prepareImeForPauseMenu()
         emulator.ensurePauseMenuOnTop()
         releaseInputs(emulator)
-        val paused = if (pauseGame) {
-            if (!setNativePauseReasonEnabled(NativeLib.PAUSE_REASON_MENU, true)) {
+        // With no native session there is nothing to pause, and the menu must still open -
+        // otherwise the pause menu becomes unreachable. Only guard when we actually asked
+        // for the game to be paused.
+        val nativeSessionRunning = isNativeAppRunning()
+        val paused = if (pauseGame && nativeSessionRunning) {
+            if (!setPauseReasonAsync(NativeLib.PAUSE_REASON_MENU, true)) {
                 return
             }
             true
         } else {
             isNativeAppPaused()
         }
-        if (!setNativeInputIntercepted(true)) {
-            if (pauseGame) {
-                setNativePauseReasonEnabled(NativeLib.PAUSE_REASON_MENU, false)
+        if (nativeSessionRunning && !setNativeInputInterceptedAsync(true)) {
+            if (paused) {
+                setPauseReasonAsync(NativeLib.PAUSE_REASON_MENU, false)
             }
             return
         }
@@ -140,9 +159,9 @@ class EmulationSessionViewModel(application: Application) : AndroidViewModel(app
     fun closeMenu(emulator: Emulator) {
         releaseInputs(emulator)
         if (uiState.isPaused) {
-            setNativePauseReasonEnabled(NativeLib.PAUSE_REASON_MENU, false)
+            setPauseReasonAsync(NativeLib.PAUSE_REASON_MENU, false)
         }
-        setNativeInputIntercepted(false)
+        setNativeInputInterceptedAsync(false)
         uiState = uiState.copy(
             showMenu = false,
             isPaused = false,
@@ -159,7 +178,10 @@ class EmulationSessionViewModel(application: Application) : AndroidViewModel(app
             closeMenu(emulator)
         } else {
             releaseInputs(emulator)
-            if (!setNativePauseReasonEnabled(NativeLib.PAUSE_REASON_MENU, true)) {
+            if (!isNativeAppRunning()) {
+                return
+            }
+            if (!setPauseReasonAsync(NativeLib.PAUSE_REASON_MENU, true)) {
                 return
             }
             uiState = uiState.copy(isPaused = true, statusMessage = null)
@@ -291,10 +313,30 @@ class EmulationSessionViewModel(application: Application) : AndroidViewModel(app
             emulator = emulator,
             config = transform(currentOverlayConfig()).normalized()
         )
-        persistOverlayState(updatedOverlayState)
+        // Dragging a slider calls this for every step, and persisting writes about forty
+        // SharedPreferences keys. The UI is updated immediately while the write is
+        // coalesced, so only the last value of a gesture reaches storage.
+        pendingOverlayState = updatedOverlayState
+        scheduleOverlayPersist()
         uiState = uiState.withOverlayConfig(updatedOverlayState.config)
         applyOverlayState(emulator)
     }
+
+    private fun scheduleOverlayPersist() {
+        val handler = overlayPersistHandler ?: OverlayPersistHandler().also { overlayPersistHandler = it }
+        if (!handler.hasCallbacks(overlayPersistRunnable)) {
+            handler.postDelayed(overlayPersistRunnable, OVERLAY_PERSIST_DEBOUNCE_MS)
+        }
+    }
+
+    private fun flushOverlayPersist() {
+        val state = pendingOverlayState ?: return
+        pendingOverlayState = null
+        overlayPersistHandler?.removeCallbacks(overlayPersistRunnable)
+        persistOverlayState(state)
+    }
+
+    private inner class OverlayPersistHandler : android.os.Handler(android.os.Looper.getMainLooper())
 
     fun promoteOverlayToGameOverride(emulator: Emulator) {
         val titleId = uiState.titleId
@@ -353,20 +395,60 @@ class EmulationSessionViewModel(application: Application) : AndroidViewModel(app
         return useGameOverride to overlayState
     }
 
+    // Suspending every guest thread happens under the kernel mutex on the calling thread,
+    // so it must not run on the UI thread: on a heavy game the suspend calls are slow
+    // enough to trip an ANR. The cheap atomic liveness check stays synchronous so the
+    // caller keeps its "is a session live" guard, while the suspending part is handed to a
+    // background thread.
+    private fun setPauseReasonAsync(reasonMask: Int, enabled: Boolean): Boolean {
+        if (!isNativeAppRunning()) {
+            return false
+        }
+
+        val executor = pauseExecutor
+        if (executor.isShutdown) {
+            return false
+        }
+
+        executor.execute { runCatching { NativeLib.setPauseReasonEnabled(reasonMask, enabled) } }
+        return true
+    }
+
+    private fun isNativeAppRunning(): Boolean {
+        return runCatching { NativeLib.isAppRunning() }.getOrDefault(false)
+    }
+
     private fun releaseInputs(emulator: Emulator) {
         runCatching { emulator.releaseControllerOverlayInputs() }
     }
 
-    private fun setNativePauseReasonEnabled(reasonMask: Int, enabled: Boolean): Boolean {
-        return runCatching { NativeLib.setPauseReasonEnabled(reasonMask, enabled) }.getOrDefault(false)
-    }
+    
 
-    private fun setNativeInputIntercepted(intercepted: Boolean): Boolean {
-        return runCatching { NativeLib.setInputIntercepted(intercepted) }.getOrDefault(false)
+    private fun setNativeInputInterceptedAsync(intercepted: Boolean): Boolean {
+        if (!isNativeAppRunning()) {
+            return false
+        }
+
+        val executor = pauseExecutor
+        if (executor.isShutdown) {
+            return false
+        }
+
+        executor.execute { runCatching { NativeLib.setInputIntercepted(intercepted) } }
+        return true
     }
 
     private fun isNativeAppPaused(): Boolean {
         return runCatching { NativeLib.isAppPaused() }.getOrDefault(false)
+    }
+
+    override fun onCleared() {
+        // A debounced write must not be lost when the session viewmodel goes away.
+        flushOverlayPersist()
+        overlayPersistHandler?.removeCallbacksAndMessages(null)
+        overlayPersistHandler = null
+        pauseExecutor.shutdown()
+        super.onCleared()
     }
 
     private fun EmulationSessionUiState.withOverlayConfig(config: OverlayConfig): EmulationSessionUiState {

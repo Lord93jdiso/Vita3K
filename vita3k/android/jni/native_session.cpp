@@ -17,6 +17,7 @@
 #include <jni.h>
 
 #include <algorithm>
+#include <atomic>
 
 namespace {
 
@@ -80,7 +81,17 @@ Java_org_vita3k_emulator_NativeLib_setPauseReasonEnabled(JNIEnv *, jclass, jint 
 JNIEXPORT jboolean JNICALL
 Java_org_vita3k_emulator_NativeLib_isAppRunning(JNIEnv *, jclass) {
     auto *controller = get_app_session_controller();
-    return controller && controller->has_active_session() ? JNI_TRUE : JNI_FALSE;
+    const bool running = controller && controller->has_active_session();
+
+    // The UI polls this on the way back to the library, which is exactly when a game that
+    // just exited may have created save data or a shader cache. The per-app action mask is
+    // cached, so without this the delete entries would stay missing until a manual refresh.
+    static std::atomic<bool> was_running{ false };
+    const bool previous = was_running.exchange(running, std::memory_order_relaxed);
+    if (previous && !running)
+        invalidate_app_info_cache();
+
+    return running ? JNI_TRUE : JNI_FALSE;
 }
 
 JNIEXPORT void JNICALL

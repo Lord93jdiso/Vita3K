@@ -199,6 +199,26 @@ static void render_loop(renderer::State &state, DisplayState &display, GxmState 
         const int total = static_cast<int>(state.precompile_queue.size());
         state.precompile_total = total;
 
+        // Presented once up front so the progress overlay is on screen immediately. Without
+        // it the display keeps whatever it had for the whole pass, which reads as a hang.
+        if (progress_overlay && total > 0) {
+            if (!state.set_current()) {
+                state.done_current();
+                return;
+            }
+            progress_overlay->set_progress(0, total);
+            state.render_frame(display, gxm, mem);
+            state.swap_window();
+        }
+
+        // Presenting after every shader made the pass cost one vsync interval per cached
+        // shader, which on a 2000-entry cache is over half a minute of pure presentation
+        // on top of the compilation itself. Update the progress overlay on the same
+        // schedule but only present once every few shaders, and keep the counter honest so
+        // the bar still moves visibly.
+        constexpr int shaders_per_present = 8;
+        int since_present = 0;
+
         for (int i = 0; i < total && !state.render_abort.load(std::memory_order_relaxed); ++i) {
             if (!state.set_current())
                 break;
@@ -206,11 +226,21 @@ static void render_loop(renderer::State &state, DisplayState &display, GxmState 
             state.precompile_shader(state.precompile_queue[i]);
             state.precompile_progress = i + 1;
 
-            if (progress_overlay) {
-                progress_overlay->set_progress(i + 1, total);
-                state.render_frame(display, gxm, mem);
-                state.swap_window();
-            }
+            if (!progress_overlay)
+                continue;
+
+            progress_overlay->set_progress(i + 1, total);
+
+            // Presented once every few shaders, and always on the last one. The immediate
+            // first update comes from the block above, before the loop.
+            ++since_present;
+            const bool last = (i + 1 >= total);
+            if (!last && since_present < shaders_per_present)
+                continue;
+
+            since_present = 0;
+            state.render_frame(display, gxm, mem);
+            state.swap_window();
         }
 
         state.precompile_queue.clear();

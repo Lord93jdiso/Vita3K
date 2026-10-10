@@ -64,6 +64,10 @@ struct VKState : public renderer::State {
     ScreenRenderer screen_renderer;
     OverlayRenderer overlay_renderer;
 
+    // Mirrored from Config in late_init: the pipeline cache reaches shader generation
+    // without a config argument.
+    bool shader_log = false;
+
     // Used for memory allocation and general query later.
     vk::PhysicalDevice physical_device;
     vk::PhysicalDeviceProperties physical_device_properties;
@@ -112,6 +116,12 @@ struct VKState : public renderer::State {
     vkutil::Buffer default_buffer;
 
     bool support_fsr = false;
+    // Half-precision shader support. Kept separate from support_fsr: the FSR passes are
+    // fp32 and no longer depend on it.
+    bool support_fp16 = false;
+    // Set from the config in late_init, once support_fsr is known.
+    bool fsr_enabled = false;
+    float fsr_sharpness = 0.0f;
     // support for the VK_KHR_uniform_buffer_standard_layout extension, needed for memory mapping and texture viewport
     bool support_standard_layout = false;
     bool support_rasterized_order_access = false;

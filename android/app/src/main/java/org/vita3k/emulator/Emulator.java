@@ -49,6 +49,8 @@ import java.io.FileOutputStream;
 import java.io.IOException;
 import java.io.InputStream;
 import java.util.Arrays;
+import java.util.concurrent.ExecutorService;
+import java.util.concurrent.Executors;
 
 import org.libsdl.app.SDLActivity;
 import org.libsdl.app.SDLDummyEdit;
@@ -76,6 +78,11 @@ public class Emulator extends SDLActivity
     static final int FOLDER_DIALOG_CODE = 546;
     static final int FOLDER_ACCESS_SETTINGS_CODE = 547;
     static final int FOLDER_ACCESS_PERMISSION_CODE = 548;
+    // The native side blocks the guest thread until filedialogReturn() answers, so every
+    // branch that can abandon a dialog must answer - otherwise the emulation thread stalls.
+    private static final int DIALOG_NONE = 0;
+    private static final int DIALOG_FILE = 1;
+    private static final int DIALOG_FOLDER = 2;
     public interface ImagePathResultCallback {
         void onResult(String path);
     }
@@ -102,6 +109,10 @@ public class Emulator extends SDLActivity
     private int lastTextInputType;
     private boolean hasLastTextInputState;
     private ImagePathResultCallback pendingImagePathCallback;
+    // Which picker the native guest asked for, so a deferred dialog resumes with the
+    // right kind after the storage permission round-trip.
+    private int pendingNativeDialog = DIALOG_NONE;
+    
 
     public static Intent createLaunchIntent(Context context, String titleId, String gameTitle) {
         Intent intent = new Intent(context, Emulator.class);
@@ -198,6 +209,13 @@ public class Emulator extends SDLActivity
         requestRelaunchFromIntent(intent);
     }
 
+    // Single-threaded on purpose: pause requests must not overtake each other.
+    private final ExecutorService backgroundTaskExecutor = Executors.newSingleThreadExecutor(runnable -> {
+        final Thread thread = new Thread(runnable, "Vita3K-Background");
+        thread.setDaemon(true);
+        return thread;
+    });
+
     @Override
     protected void onCreate(Bundle savedInstanceState) {
         super.onCreate(savedInstanceState);
@@ -267,6 +285,10 @@ public class Emulator extends SDLActivity
 
     @Override
     protected void onDestroy() {
+        // Unblock the guest thread before the activity goes away, otherwise a pending
+        // native file dialog wait never completes.
+        releaseNativeDialog();
+        backgroundTaskExecutor.shutdownNow();
         if (inputManager != null) {
             inputManager.unregisterInputDeviceListener(this);
         }
@@ -669,6 +691,7 @@ public class Emulator extends SDLActivity
 
     @Keep
     public void showFileDialog() {
+        pendingNativeDialog = DIALOG_FILE;
         if (!StorageAccess.hasStorageAccess(this)) {
             requestFolderAccess();
             return;
@@ -683,6 +706,7 @@ public class Emulator extends SDLActivity
 
     @Keep
     public void showFolderDialog() {
+        pendingNativeDialog = DIALOG_FOLDER;
         if (!StorageAccess.hasStorageAccess(this)) {
             requestFolderAccess();
             return;
@@ -701,6 +725,43 @@ public class Emulator extends SDLActivity
         }
 
         launchImagePicker();
+    }
+
+    // Releases the guest thread with an empty result. Safe to call more than once and
+    // harmless when no native dialog is pending.
+    private void releaseNativeDialog() {
+        if (pendingNativeDialog == DIALOG_NONE) {
+            return;
+        }
+        pendingNativeDialog = DIALOG_NONE;
+        try {
+            filedialogReturn("");
+        } catch (Throwable ignored) {
+            // The native library may already be gone during teardown.
+        }
+    }
+
+    // Resumes the picker the guest asked for once storage access is available.
+    private void resumePendingNativeDialog() {
+        final int pending = pendingNativeDialog;
+        if (pending == DIALOG_NONE) {
+            return;
+        }
+        if (!StorageAccess.hasStorageAccess(this)) {
+            releaseNativeDialog();
+            return;
+        }
+        if (pending == DIALOG_FILE) {
+            startActivityForResult(
+                    Intent.createChooser(
+                            StorageAccess.createFilePickerIntent(new String[]{"*/*"}),
+                            "Choose a file"),
+                    FILE_DIALOG_CODE);
+        } else {
+            startActivityForResult(
+                    Intent.createChooser(StorageAccess.createFolderPickerIntent(), "Choose a folder"),
+                    FOLDER_DIALOG_CODE);
+        }
     }
 
     private void launchImagePicker() {
@@ -829,21 +890,20 @@ public class Emulator extends SDLActivity
 
         switch (requestCode) {
             case FOLDER_ACCESS_SETTINGS_CODE:
-                if (StorageAccess.hasStorageAccess(this)) {
-                    if (pendingImagePathCallback != null) {
+                if (pendingImagePathCallback != null) {
+                    if (StorageAccess.hasStorageAccess(this)) {
                         launchImagePicker();
                     } else {
-                        showFolderDialog();
+                        dispatchPendingImagePath(null);
                     }
                 } else {
-                    if (pendingImagePathCallback != null) {
-                        dispatchPendingImagePath(null);
-                    } else {
-                        filedialogReturn("");
-                    }
+                    resumePendingNativeDialog();
                 }
                 break;
             case FILE_DIALOG_CODE:
+                if (pendingNativeDialog != DIALOG_NONE) {
+                    pendingNativeDialog = DIALOG_NONE;
+                }
                 if (pendingImagePathCallback != null) {
                     final String resolvedPath = resultCode == RESULT_OK && data != null && data.getData() != null
                             ? StorageAccess.resolveUriToPath(this, data.getData())
@@ -861,6 +921,7 @@ public class Emulator extends SDLActivity
                 }
                 break;
             case FOLDER_DIALOG_CODE: {
+                pendingNativeDialog = DIALOG_NONE;
                 final String selectedPath = resultCode == RESULT_OK && data != null && data.getData() != null
                         ? StorageAccess.resolveTreeUriToPath(this, data.getData())
                         : null;
@@ -880,18 +941,14 @@ public class Emulator extends SDLActivity
             return;
         }
 
-        if (StorageAccess.hasStorageAccess(this)) {
-            if (pendingImagePathCallback != null) {
+        if (pendingImagePathCallback != null) {
+            if (StorageAccess.hasStorageAccess(this)) {
                 launchImagePicker();
             } else {
-                showFolderDialog();
+                dispatchPendingImagePath(null);
             }
         } else {
-            if (pendingImagePathCallback != null) {
-                dispatchPendingImagePath(null);
-            } else {
-                filedialogReturn("");
-            }
+            resumePendingNativeDialog();
         }
     }
 
@@ -1108,11 +1165,10 @@ public class Emulator extends SDLActivity
         return initialized;
     }
 
-    private void suspendForBackgroundIfNeeded() {
-        if (isFinishing()) {
-            return;
-        }
-
+    // Suspending the guest's threads runs under the kernel mutex on the calling thread and is
+    // slow on a heavy game, so it is handed to a background thread. The cheap atomic
+    // liveness check stays here to keep the "no live session" guard on the UI thread.
+    private void setPauseReasonInBackground(int reasonMask, boolean enabled) {
         boolean running = false;
         try {
             running = NativeLib.INSTANCE.isAppRunning();
@@ -1122,28 +1178,29 @@ public class Emulator extends SDLActivity
             return;
         }
 
-        try {
-            NativeLib.INSTANCE.setPauseReasonEnabled(NativeLib.PAUSE_REASON_BACKGROUND, true);
-        } catch (Throwable ignored) {
+        if (backgroundTaskExecutor.isShutdown()) {
+            return;
         }
+
+        backgroundTaskExecutor.execute(() -> {
+            try {
+                NativeLib.INSTANCE.setPauseReasonEnabled(reasonMask, enabled);
+            } catch (Throwable ignored) {
+            }
+        });
+    }
+
+    private void suspendForBackgroundIfNeeded() {
+        if (isFinishing()) {
+            return;
+        }
+
+        setPauseReasonInBackground(NativeLib.PAUSE_REASON_BACKGROUND, true);
     }
 
     private void resumeFromBackgroundIfNeeded() {
         final View anchor = mSurface != null ? mSurface : getWindow().getDecorView();
-        anchor.post(() -> {
-            boolean running = false;
-            try {
-                running = NativeLib.INSTANCE.isAppRunning();
-            } catch (Throwable ignored) {
-            }
-            if (!running) {
-                return;
-            }
-            try {
-                NativeLib.INSTANCE.setPauseReasonEnabled(NativeLib.PAUSE_REASON_BACKGROUND, false);
-            } catch (Throwable ignored) {
-            }
-        });
+        anchor.post(() -> setPauseReasonInBackground(NativeLib.PAUSE_REASON_BACKGROUND, false));
     }
 
     private boolean hasLaunchRequest(Intent intent) {

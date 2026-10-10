@@ -25,8 +25,15 @@
 #include <jni.h>
 #include <touch/functions.h>
 
-static int virtual_joystick_id = -1;
-static SDL_Joystick *virtual_joystick = nullptr;
+#include <atomic>
+#include <mutex>
+
+// Attached from the UI thread (InputOverlay) and closed from the SDL thread during
+// session teardown, so both the handle and the id are published atomically.
+static std::atomic<int> virtual_joystick_id{ -1 };
+static std::atomic<SDL_Joystick *> virtual_joystick{ nullptr };
+// Closing a joystick must not race with axis/button writes coming from the overlay.
+static std::mutex virtual_joystick_mutex;
 
 static void refresh_overlay_controllers() {
     auto *emuenv = get_emuenv();
@@ -38,12 +45,14 @@ static void refresh_overlay_controllers() {
 }
 
 void detach_overlay_virtual_controller() {
-    if (virtual_joystick)
-        SDL_CloseJoystick(virtual_joystick);
-    if (virtual_joystick_id >= 0)
-        SDL_DetachVirtualJoystick(virtual_joystick_id);
-    virtual_joystick = nullptr;
-    virtual_joystick_id = -1;
+    {
+        std::lock_guard<std::mutex> lock(virtual_joystick_mutex);
+        if (SDL_Joystick *joystick = virtual_joystick.exchange(nullptr))
+            SDL_CloseJoystick(joystick);
+        if (const int id = virtual_joystick_id.exchange(-1); id >= 0)
+            SDL_DetachVirtualJoystick(id);
+    }
+
     refresh_overlay_controllers();
 }
 
@@ -60,17 +69,23 @@ void attach_overlay_virtual_controller() {
     desc.nbuttons = SDL_GAMEPAD_BUTTON_COUNT;
     desc.name = "Vita3K Virtual Controller";
 
-    virtual_joystick_id = SDL_AttachVirtualJoystick(&desc);
-    if (virtual_joystick_id == 0) {
+    const int id = SDL_AttachVirtualJoystick(&desc);
+    if (id == 0) {
         SDL_Log("Could not create overlay virtual controller: %s", SDL_GetError());
         return;
     }
 
-    virtual_joystick = SDL_OpenJoystick(virtual_joystick_id);
-    if (!virtual_joystick) {
+    SDL_Joystick *joystick = SDL_OpenJoystick(id);
+    if (!joystick) {
         SDL_Log("Could not create virtual joystick: %s", SDL_GetError());
-        detach_overlay_virtual_controller();
+        SDL_DetachVirtualJoystick(id);
         return;
+    }
+
+    {
+        std::lock_guard<std::mutex> lock(virtual_joystick_mutex);
+        virtual_joystick_id.store(id, std::memory_order_release);
+        virtual_joystick.store(joystick, std::memory_order_release);
     }
 
     refresh_overlay_controllers();
@@ -90,22 +105,33 @@ Java_org_vita3k_emulator_overlay_InputOverlay_detachController(JNIEnv *env, jobj
 
 JNIEXPORT void JNICALL
 Java_org_vita3k_emulator_overlay_InputOverlay_setAxis(JNIEnv *env, jobject thiz, jint axis, jshort value) {
-    if (!virtual_joystick)
+    SDL_Joystick *joystick = virtual_joystick.load(std::memory_order_acquire);
+    if (!joystick)
         return;
 
-    SDL_SetJoystickVirtualAxis(virtual_joystick, axis, value);
+    // Held for the duration of the write so detach cannot close the handle mid-update.
+    std::lock_guard<std::mutex> lock(virtual_joystick_mutex);
+    if (virtual_joystick.load(std::memory_order_relaxed) != joystick)
+        return;
+
+    SDL_SetJoystickVirtualAxis(joystick, axis, value);
 }
 
 JNIEXPORT void JNICALL
 Java_org_vita3k_emulator_overlay_InputOverlay_setButton(JNIEnv *env, jobject thiz, jint button, jboolean value) {
-    if (!virtual_joystick)
+    SDL_Joystick *joystick = virtual_joystick.load(std::memory_order_acquire);
+    if (!joystick)
+        return;
+
+    std::lock_guard<std::mutex> lock(virtual_joystick_mutex);
+    if (virtual_joystick.load(std::memory_order_relaxed) != joystick)
         return;
 
     if (button < 0)
         // l2/r2
-        SDL_SetJoystickVirtualAxis(virtual_joystick, -button, value ? SDL_MAX_SINT16 : 0);
+        SDL_SetJoystickVirtualAxis(joystick, -button, value ? SDL_MAX_SINT16 : 0);
     else
-        SDL_SetJoystickVirtualButton(virtual_joystick, button, value);
+        SDL_SetJoystickVirtualButton(joystick, button, value);
 }
 
 JNIEXPORT void JNICALL

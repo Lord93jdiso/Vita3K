@@ -33,9 +33,29 @@
 
 #include <algorithm>
 #include <cctype>
+#include <cmath>
+#include <map>
 #include <mutex>
+#include <string>
+#include <vector>
 
 namespace {
+
+// Enumerating Vulkan devices for a custom driver builds an instance and dlopens the
+// driver, costing tens of milliseconds, and the settings screen asks again on every
+// recomposition while a driver dropdown is open. A driver's capabilities do not change
+// during the process lifetime, so results are memoised per driver name.
+renderer::VulkanDeviceInfo &cached_vulkan_device_info(const std::string &driver_name) {
+    static std::mutex mutex;
+    static std::map<std::string, renderer::VulkanDeviceInfo> cache;
+
+    std::lock_guard<std::mutex> lock(mutex);
+    const auto it = cache.find(driver_name);
+    if (it != cache.end())
+        return it->second;
+
+    return cache.emplace(driver_name, renderer::enumerate_vulkan_devices(driver_name)).first->second;
+}
 
 struct EmulatorConfigFields {
     jclass cls = nullptr;
@@ -58,6 +78,8 @@ struct EmulatorConfigFields {
     jfieldID fpsHack = nullptr;
     jfieldID turboMode = nullptr;
     jfieldID shaderCache = nullptr;
+    jfieldID shaderLog = nullptr;
+    jfieldID fsrQualityMode = nullptr;
     jfieldID spirvShader = nullptr;
     jfieldID customDriverName = nullptr;
     jfieldID audioBackend = nullptr;
@@ -143,6 +165,8 @@ EmulatorConfigFields resolve_config_fields(JNIEnv *env) {
     fields.fpsHack = env->GetFieldID(fields.cls, "fpsHack", "Z");
     fields.turboMode = env->GetFieldID(fields.cls, "turboMode", "Z");
     fields.shaderCache = env->GetFieldID(fields.cls, "shaderCache", "Z");
+    fields.shaderLog = env->GetFieldID(fields.cls, "shaderLog", "Z");
+    fields.fsrQualityMode = env->GetFieldID(fields.cls, "fsrQualityMode", "I");
     fields.spirvShader = env->GetFieldID(fields.cls, "spirvShader", "Z");
     fields.customDriverName = env->GetFieldID(fields.cls, "customDriverName", "Ljava/lang/String;");
     fields.audioBackend = env->GetFieldID(fields.cls, "audioBackend", "Ljava/lang/String;");
@@ -323,6 +347,8 @@ void fill_config_object(JNIEnv *env, jobject obj, const EmulatorConfigFields &fi
     env->SetBooleanField(obj, fields.fpsHack, current_config.fps_hack);
     env->SetBooleanField(obj, fields.turboMode, config.turbo_mode);
     env->SetBooleanField(obj, fields.shaderCache, current_config.shader_cache);
+    env->SetBooleanField(obj, fields.shaderLog, current_config.shader_log);
+    env->SetIntField(obj, fields.fsrQualityMode, static_cast<jint>(current_config.fsr_quality_mode));
     env->SetBooleanField(obj, fields.spirvShader, current_config.spirv_shader);
     {
         jstring value = env->NewStringUTF(current_config.custom_driver_name.c_str());
@@ -465,6 +491,8 @@ void read_config_object(JNIEnv *env, jobject obj, const EmulatorConfigFields &fi
     current_config.fps_hack = env->GetBooleanField(obj, fields.fpsHack) != JNI_FALSE;
     config.turbo_mode = env->GetBooleanField(obj, fields.turboMode) != JNI_FALSE;
     current_config.shader_cache = env->GetBooleanField(obj, fields.shaderCache) != JNI_FALSE;
+    current_config.shader_log = env->GetBooleanField(obj, fields.shaderLog) != JNI_FALSE;
+    current_config.fsr_quality_mode = static_cast<int>(env->GetIntField(obj, fields.fsrQualityMode));
     current_config.spirv_shader = env->GetBooleanField(obj, fields.spirvShader) != JNI_FALSE;
     {
         auto *value = reinterpret_cast<jstring>(env->GetObjectField(obj, fields.customDriverName));
@@ -806,7 +834,7 @@ Java_org_vita3k_emulator_NativeLib_getSupportedMemoryMappingMask(JNIEnv *env, jc
     if (custom_driver_name.empty())
         return static_cast<jint>(get_default_supported_memory_mapping_mask(get_emuenv()));
 
-    const auto device_info = renderer::enumerate_vulkan_devices(custom_driver_name);
+    const auto &device_info = cached_vulkan_device_info(custom_driver_name);
     if (device_info.mapping_method_masks.empty())
         return static_cast<jint>(1 << 0);
 
@@ -827,7 +855,7 @@ Java_org_vita3k_emulator_NativeLib_getCustomDriverSupportInfo(JNIEnv *env, jclas
         return result;
     }
 
-    const auto device_info = renderer::enumerate_vulkan_devices(custom_driver_name);
+    const auto &device_info = cached_vulkan_device_info(custom_driver_name);
 
     jint values[2] = {
         device_info.mapping_method_masks.empty() ? static_cast<jint>(1 << 0) : static_cast<jint>(device_info.mapping_method_masks.front()),
@@ -842,6 +870,39 @@ Java_org_vita3k_emulator_NativeLib_getCustomDriverSupportInfo(JNIEnv *env, jclas
 JNIEXPORT jboolean JNICALL
 Java_org_vita3k_emulator_NativeLib_shouldShowCustomDriverOptions(JNIEnv *, jclass) {
     return default_gpu_is_mali(get_emuenv()) ? JNI_FALSE : JNI_TRUE;
+}
+
+// FSR availability has to be answered without a live renderer: emuenv.renderer only exists
+// while a game session is running and the settings screen is shown outside one. The Vulkan
+// device probe is cached, so this does not enumerate devices on every call.
+static bool device_supports_fsr(EmuEnvState *emuenv) {
+    if (!emuenv || emuenv->backend_renderer != renderer::Backend::Vulkan)
+        return false;
+
+    const auto *device_info = get_cached_default_vulkan_device_info(emuenv);
+    return device_info && device_info->supports_fsr;
+}
+
+JNIEXPORT jboolean JNICALL
+Java_org_vita3k_emulator_NativeLib_isFsrSupported(JNIEnv *, jclass) {
+    return device_supports_fsr(get_emuenv()) ? JNI_TRUE : JNI_FALSE;
+}
+
+// Render scale each preset uses, so the settings screen can explain the actual cost.
+// Returns an empty array when FSR is unavailable on this device.
+JNIEXPORT jintArray JNICALL
+Java_org_vita3k_emulator_NativeLib_getFsrRenderScales(JNIEnv *env, jclass) {
+    std::vector<jint> scales;
+    if (device_supports_fsr(get_emuenv())) {
+        scales.reserve(renderer::fsr_quality_mode_count);
+        for (int mode = 0; mode < renderer::fsr_quality_mode_count; mode++)
+            scales.push_back(static_cast<jint>(std::lround(renderer::fsr_quality_preset(mode).render_scale * 100.f)));
+    }
+
+    jintArray result = env->NewIntArray(static_cast<jsize>(scales.size()));
+    if (!scales.empty())
+        env->SetIntArrayRegion(result, 0, static_cast<jsize>(scales.size()), scales.data());
+    return result;
 }
 
 JNIEXPORT jobjectArray JNICALL

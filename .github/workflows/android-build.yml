@@ -1,0 +1,63 @@
+name: Android Build
+
+on:
+  push:
+    branches: [android-ci]
+    paths-ignore:
+      - '**.md'
+  workflow_dispatch:
+
+env:
+  ANDROID_API: '28'
+  NDK_VERSION: '27.2.12479018'
+
+jobs:
+  android-build:
+    name: Android arm64-v8a
+    runs-on: ubuntu-24.04
+
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          submodules: recursive
+
+      - name: Install build tools
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y ninja-build cmake python3 pkg-config
+
+      - name: Set up the Android SDK and NDK
+        uses: android-actions/setup-android@v3
+
+      - name: Install SDK packages
+        run: |
+          sdkmanager "platform-tools" "platforms;android-${ANDROID_API}" "ndk;${NDK_VERSION}"
+
+      - name: Set up vcpkg
+        run: |
+          git clone https://github.com/microsoft/vcpkg.git $VCPKG_ROOT
+          $VCPKG_ROOT/bootstrap-vcpkg.sh -disableMetrics
+
+      - name: Configure
+        run: |
+          # cmake/vcpkg_android.cmake resolves both from the environment, so they have to
+          # point at the real locations on this runner rather than being guessed.
+          echo "ANDROID_NDK_HOME=$ANDROID_NDK_ROOT" >> $GITHUB_ENV
+          echo "VCPKG_ROOT=$VCPKG_INSTALLATION_ROOT" >> $GITHUB_ENV
+          echo "VCPKG_BINARY_SOURCES=clear;x-gha,readwrite" >> $GITHUB_ENV
+          cmake -B build-android -G Ninja \
+            -DCMAKE_TOOLCHAIN_FILE=cmake/vcpkg_android.cmake \
+            -DCMAKE_BUILD_TYPE=Release \
+            -DANDROID_ABI=arm64-v8a \
+            -DANDROID_PLATFORM=android-${ANDROID_API} \
+            -DVCPKG_CHAINLOAD_TOOLCHAIN_FILE=${ANDROID_NDK_ROOT}/build/cmake/android.toolchain.cmake
+
+      - name: Build
+        run: cmake --build build-android --target vita3k --config Release
+
+      - name: Upload libVita3K.so
+        uses: actions/upload-artifact@v4
+        with:
+          name: libVita3K-arm64
+          path: build-android/vita3k/libVita3K.so

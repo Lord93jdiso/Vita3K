@@ -39,11 +39,18 @@
 #include <SDL3/SDL_main.h>
 
 #include <algorithm>
+#include <chrono>
 #include <cstdio>
 #include <cstring>
+#include <mutex>
 #include <optional>
+#include <string>
 
 namespace {
+
+// Floor on how fast the event loop may iterate when the queue is never empty. Comfortably
+// above any real event rate, so no input is delayed, but far below spinning at core speed.
+constexpr long long event_loop_min_iteration_us = 2000;
 
 void reset_android_session_audio(EmuEnvState &emuenv) {
     if (!emuenv.audio.adapter)
@@ -259,19 +266,93 @@ SDLMAIN_DECLSPEC int SDL_main(int argc, char *argv[]) {
         return -1;
     }
 
+    // JNI handles resolved once per process: the SDL activity reference is owned by SDL,
+    // so it must never be passed to DeleteLocalRef, and string-based method lookups on
+    // every call are pure overhead.
+    struct AndroidActivityJni {
+        std::mutex mutex;
+        jclass clazz = nullptr;
+        jmethodID open_pause_menu = nullptr;
+        jmethodID set_current_game_id = nullptr;
+        jmethodID get_display_rotation = nullptr;
+    };
+
+    AndroidActivityJni &activity_jni() {
+        static AndroidActivityJni cache;
+        return cache;
+    }
+
+    bool ensure_activity_jni(JNIEnv * jni_env, jobject activity) {
+        auto &cache = activity_jni();
+        {
+            std::lock_guard<std::mutex> lock(cache.mutex);
+            if (cache.clazz)
+                return true;
+        }
+
+        jclass local_clazz = jni_env->GetObjectClass(activity);
+        if (!local_clazz)
+            return false;
+
+        jmethodID open_pause_menu = jni_env->GetMethodID(local_clazz, "openPauseMenuFromController", "()V");
+        jmethodID set_current_game_id = jni_env->GetMethodID(local_clazz, "setCurrentGameId", "(Ljava/lang/String;)V");
+        jmethodID get_display_rotation = jni_env->GetMethodID(local_clazz, "getNativeDisplayRotation", "()I");
+
+        // A global ref survives across threads; it is released again when the activity is
+        // destroyed, otherwise every session restart would leak one.
+        jclass global_clazz = reinterpret_cast<jclass>(jni_env->NewGlobalRef(local_clazz));
+        jni_env->DeleteLocalRef(local_clazz);
+
+        std::lock_guard<std::mutex> lock(cache.mutex);
+        if (cache.clazz) {
+            if (global_clazz)
+                jni_env->DeleteGlobalRef(global_clazz);
+            return true;
+        }
+
+        cache.open_pause_menu = open_pause_menu;
+        cache.set_current_game_id = set_current_game_id;
+        cache.get_display_rotation = get_display_rotation;
+        cache.clazz = global_clazz;
+
+        return cache.clazz != nullptr;
+    }
+
+    void invalidate_activity_jni() {
+        auto &cache = activity_jni();
+        jclass stale = nullptr;
+        {
+            std::lock_guard<std::mutex> lock(cache.mutex);
+            stale = cache.clazz;
+            cache.clazz = nullptr;
+            cache.open_pause_menu = nullptr;
+            cache.set_current_game_id = nullptr;
+            cache.get_display_rotation = nullptr;
+        }
+
+        JNIEnv *jni_env = reinterpret_cast<JNIEnv *>(SDL_GetAndroidJNIEnv());
+        if (jni_env && stale)
+            jni_env->DeleteGlobalRef(stale);
+    }
+
     const auto open_pause_menu = []() {
         JNIEnv *jni_env = reinterpret_cast<JNIEnv *>(SDL_GetAndroidJNIEnv());
         jobject activity = reinterpret_cast<jobject>(SDL_GetAndroidActivity());
         if (!jni_env || !activity)
             return;
 
-        jclass clazz = jni_env->GetObjectClass(activity);
-        jmethodID method_id = jni_env->GetMethodID(clazz, "openPauseMenuFromController", "()V");
+        if (!ensure_activity_jni(jni_env, activity))
+            return;
+
+        jmethodID method_id = nullptr;
+        {
+            auto &cache = activity_jni();
+            std::lock_guard<std::mutex> lock(cache.mutex);
+            method_id = cache.open_pause_menu;
+        }
+
         if (method_id)
             jni_env->CallVoidMethod(activity, method_id);
-
-        jni_env->DeleteLocalRef(clazz);
-        jni_env->DeleteLocalRef(activity);
     };
 
     const auto sync_current_game_id = [](const std::string &game_id) {
@@ -280,16 +361,21 @@ SDLMAIN_DECLSPEC int SDL_main(int argc, char *argv[]) {
         if (!jni_env || !activity)
             return;
 
-        jclass clazz = jni_env->GetObjectClass(activity);
-        jmethodID method_id = jni_env->GetMethodID(clazz, "setCurrentGameId", "(Ljava/lang/String;)V");
+        if (!ensure_activity_jni(jni_env, activity))
+            return;
+
+        jmethodID method_id = nullptr;
+        {
+            auto &cache = activity_jni();
+            std::lock_guard<std::mutex> lock(cache.mutex);
+            method_id = cache.set_current_game_id;
+        }
+
         if (method_id) {
             jstring jgame_id = jni_env->NewStringUTF(game_id.c_str());
             jni_env->CallVoidMethod(activity, method_id, jgame_id);
             jni_env->DeleteLocalRef(jgame_id);
         }
-
-        jni_env->DeleteLocalRef(clazz);
-        jni_env->DeleteLocalRef(activity);
     };
 
     AppLaunchRequest launch_request{
@@ -312,6 +398,9 @@ SDLMAIN_DECLSPEC int SDL_main(int argc, char *argv[]) {
             reset_android_session_audio(*emuenv);
 
             ime::set_sdl_window(nullptr);
+            // Cached activity references belong to the activity that is going away.
+            ime::on_activity_recreated();
+            invalidate_activity_jni();
             if (window) {
                 SDL_DestroyWindow(window);
                 window = nullptr;
@@ -334,11 +423,17 @@ SDLMAIN_DECLSPEC int SDL_main(int argc, char *argv[]) {
         {
             JNIEnv *jni_env = reinterpret_cast<JNIEnv *>(SDL_GetAndroidJNIEnv());
             jobject activity = reinterpret_cast<jobject>(SDL_GetAndroidActivity());
-            jclass clazz = jni_env->GetObjectClass(activity);
-            jmethodID method_id = jni_env->GetMethodID(clazz, "getNativeDisplayRotation", "()I");
-            set_display_rotation(emuenv->motion, jni_env->CallIntMethod(activity, method_id));
-            jni_env->DeleteLocalRef(clazz);
-            jni_env->DeleteLocalRef(activity);
+            if (jni_env && activity && ensure_activity_jni(jni_env, activity)) {
+                jmethodID method_id = nullptr;
+                {
+                    auto &cache = activity_jni();
+                    std::lock_guard<std::mutex> lock(cache.mutex);
+                    method_id = cache.get_display_rotation;
+                }
+
+                if (method_id)
+                    set_display_rotation(emuenv->motion, jni_env->CallIntMethod(activity, method_id));
+            }
         }
 
         if (!session_controller->begin_launch(launch_request, launch_request.reason != AppLaunchReason::LoadExec)) {
@@ -443,66 +538,78 @@ SDLMAIN_DECLSPEC int SDL_main(int argc, char *argv[]) {
         app::LaunchRuntimeMetrics runtime_metrics{};
 
         bool running = !pending_launch_request.has_value();
+
+        // Shared by the drain loop and the single event returned from
+        // SDL_WaitEventTimeout, so a woken event is handled identically to a polled one.
+        const auto handle_event = [&](SDL_Event &event) {
+            switch (event.type) {
+            case SDL_EVENT_QUIT:
+            case SDL_EVENT_WINDOW_CLOSE_REQUESTED:
+                running = false;
+                break;
+
+            case SDL_EVENT_KEY_DOWN:
+                if (handle_ime_keydown(*emuenv, event.key))
+                    break;
+                break;
+
+            case SDL_EVENT_TEXT_EDITING:
+                handle_ime_text_editing(*emuenv, event.edit.text);
+                break;
+
+            case SDL_EVENT_TEXT_INPUT:
+                handle_ime_text_input(*emuenv, event.text.text);
+                break;
+
+            case SDL_EVENT_FINGER_DOWN:
+            case SDL_EVENT_FINGER_MOTION:
+            case SDL_EVENT_FINGER_UP:
+            case SDL_EVENT_FINGER_CANCELED: {
+                handle_touch_event(emuenv->touch, event.tfinger);
+                auto &mouse = emuenv->ctrl.overlay_mouse;
+                mouse.x.store(event.tfinger.x * 960.f, std::memory_order_relaxed);
+                mouse.y.store(event.tfinger.y * 544.f, std::memory_order_relaxed);
+                mouse.pressed.store(event.type == SDL_EVENT_FINGER_DOWN || event.type == SDL_EVENT_FINGER_MOTION, std::memory_order_relaxed);
+                break;
+            }
+
+            case SDL_EVENT_GAMEPAD_ADDED:
+            case SDL_EVENT_GAMEPAD_REMOVED:
+                refresh_controllers(emuenv->ctrl, *emuenv);
+                break;
+
+            case SDL_EVENT_GAMEPAD_BUTTON_DOWN:
+                if (event.gbutton.button == SDL_GAMEPAD_BUTTON_GUIDE)
+                    open_pause_menu();
+                break;
+
+            case SDL_EVENT_GAMEPAD_TOUCHPAD_DOWN:
+            case SDL_EVENT_GAMEPAD_TOUCHPAD_MOTION:
+            case SDL_EVENT_GAMEPAD_TOUCHPAD_UP:
+                handle_touchpad_event(emuenv->touch, event.gtouchpad);
+                break;
+
+            case SDL_EVENT_GAMEPAD_SENSOR_UPDATE:
+                handle_motion_event(*emuenv, event.gsensor.sensor, event.gsensor);
+                break;
+            case SDL_EVENT_SENSOR_UPDATE:
+                handle_motion_event(*emuenv, SDL_GetSensorTypeForID(event.sensor.which), event.sensor);
+                break;
+
+            default:
+                break;
+            }
+        };
+
         while (running) {
             SDL_Event event;
+            bool handled_event = false;
+            const auto iteration_start = std::chrono::steady_clock::now();
+
+            // Drain whatever is already queued.
             while (SDL_PollEvent(&event)) {
-                switch (event.type) {
-                case SDL_EVENT_QUIT:
-                case SDL_EVENT_WINDOW_CLOSE_REQUESTED:
-                    running = false;
-                    break;
-
-                case SDL_EVENT_KEY_DOWN:
-                    if (handle_ime_keydown(*emuenv, event.key))
-                        break;
-                    break;
-
-                case SDL_EVENT_TEXT_EDITING:
-                    handle_ime_text_editing(*emuenv, event.edit.text);
-                    break;
-
-                case SDL_EVENT_TEXT_INPUT:
-                    handle_ime_text_input(*emuenv, event.text.text);
-                    break;
-
-                case SDL_EVENT_FINGER_DOWN:
-                case SDL_EVENT_FINGER_MOTION:
-                case SDL_EVENT_FINGER_UP:
-                case SDL_EVENT_FINGER_CANCELED: {
-                    handle_touch_event(emuenv->touch, event.tfinger);
-                    auto &mouse = emuenv->ctrl.overlay_mouse;
-                    mouse.x.store(event.tfinger.x * 960.f, std::memory_order_relaxed);
-                    mouse.y.store(event.tfinger.y * 544.f, std::memory_order_relaxed);
-                    mouse.pressed.store(event.type == SDL_EVENT_FINGER_DOWN || event.type == SDL_EVENT_FINGER_MOTION, std::memory_order_relaxed);
-                    break;
-                }
-
-                case SDL_EVENT_GAMEPAD_ADDED:
-                case SDL_EVENT_GAMEPAD_REMOVED:
-                    refresh_controllers(emuenv->ctrl, *emuenv);
-                    break;
-
-                case SDL_EVENT_GAMEPAD_BUTTON_DOWN:
-                    if (event.gbutton.button == SDL_GAMEPAD_BUTTON_GUIDE)
-                        open_pause_menu();
-                    break;
-
-                case SDL_EVENT_GAMEPAD_TOUCHPAD_DOWN:
-                case SDL_EVENT_GAMEPAD_TOUCHPAD_MOTION:
-                case SDL_EVENT_GAMEPAD_TOUCHPAD_UP:
-                    handle_touchpad_event(emuenv->touch, event.gtouchpad);
-                    break;
-
-                case SDL_EVENT_GAMEPAD_SENSOR_UPDATE:
-                    handle_motion_event(*emuenv, event.gsensor.sensor, event.gsensor);
-                    break;
-                case SDL_EVENT_SENSOR_UPDATE:
-                    handle_motion_event(*emuenv, SDL_GetSensorTypeForID(event.sensor.which), event.sensor);
-                    break;
-
-                default:
-                    break;
-                }
+                handled_event = true;
+                handle_event(event);
             }
 
             if (!pending_launch_request) {
@@ -517,8 +624,29 @@ SDLMAIN_DECLSPEC int SDL_main(int argc, char *argv[]) {
             if (!session_controller->is_running())
                 running = false;
 
-            if (running)
-                SDL_Delay(16);
+            if (!running)
+                break;
+
+            // A fixed 16 ms sleep caps polling at 60 Hz and adds up to a full frame of
+            // latency to every input event. Waiting on the event queue instead wakes the
+            // loop the instant something arrives and only falls back to the timeout when
+            // the guest is idle.
+            if (!handled_event) {
+                if (SDL_WaitEventTimeout(&event, 16))
+                    handle_event(event);
+                continue;
+            }
+
+            // Events arrived, so the loop never sleeps. High-rate sources - finger motion
+            // on the overlay, gamepad sensors - keep the queue permanently non-empty, and
+            // spinning through it would burn a core for nothing. The budget still covers a
+            // frame several times over, so input stays well under one frame of latency.
+            const auto now = std::chrono::steady_clock::now();
+            const auto elapsed = std::chrono::duration_cast<std::chrono::microseconds>(now - iteration_start);
+            if (elapsed.count() < event_loop_min_iteration_us) {
+                const auto remaining = std::chrono::microseconds(event_loop_min_iteration_us) - elapsed;
+                SDL_Delay(static_cast<Uint32>(remaining.count() / 1000));
+            }
         }
 
         LOG_INFO("Shutting down game");

@@ -8,13 +8,14 @@
 #include <cstdio>
 #include <cstring>
 #include <fstream>
+#include <mutex>
 #include <optional>
 #include <string_view>
 #include <vector>
 
 namespace {
 
-std::optional<fs::path> get_android_files_dir(JNIEnv *env) {
+std::optional<fs::path> resolve_android_files_dir(JNIEnv *env) {
     env->PushLocalFrame(8);
 
     jclass activity_thread_class = env->FindClass("android/app/ActivityThread");
@@ -39,6 +40,12 @@ std::optional<fs::path> get_android_files_dir(JNIEnv *env) {
     }
 
     jclass context_class = env->GetObjectClass(application);
+    if (!context_class) {
+        env->PopLocalFrame(nullptr);
+        LOG_ERROR("Could not resolve the application class while resolving Android files dir");
+        return std::nullopt;
+    }
+
     jmethodID get_files_dir = env->GetMethodID(context_class, "getFilesDir", "()Ljava/io/File;");
     if (!get_files_dir) {
         env->PopLocalFrame(nullptr);
@@ -54,6 +61,12 @@ std::optional<fs::path> get_android_files_dir(JNIEnv *env) {
     }
 
     jclass file_class = env->GetObjectClass(files_dir);
+    if (!file_class) {
+        env->PopLocalFrame(nullptr);
+        LOG_ERROR("Could not resolve the File class while resolving Android files dir");
+        return std::nullopt;
+    }
+
     jmethodID get_absolute_path = env->GetMethodID(file_class, "getAbsolutePath", "()Ljava/lang/String;");
     if (!get_absolute_path) {
         env->PopLocalFrame(nullptr);
@@ -74,7 +87,24 @@ std::optional<fs::path> get_android_files_dir(JNIEnv *env) {
 }
 
 std::optional<fs::path> get_custom_driver_root(JNIEnv *env) {
-    const auto files_dir = get_android_files_dir(env);
+    // The files dir is fixed for the process lifetime, yet resolving it walks
+    // ActivityThread.currentApplication().getFilesDir().getAbsolutePath() through four
+    // reflective lookups on every call, and all three driver entry points call it. Resolve
+    // once and reuse.
+    static std::mutex files_dir_mutex;
+    static std::optional<fs::path> cached_files_dir;
+    static bool files_dir_resolved = false;
+
+    std::optional<fs::path> files_dir;
+    {
+        std::lock_guard<std::mutex> lock(files_dir_mutex);
+        if (!files_dir_resolved) {
+            cached_files_dir = resolve_android_files_dir(env);
+            files_dir_resolved = true;
+        }
+        files_dir = cached_files_dir;
+    }
+
     if (!files_dir)
         return std::nullopt;
 

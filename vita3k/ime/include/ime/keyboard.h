@@ -32,6 +32,9 @@ void set_keyboard_active(bool active);
 // Push the current native IME snapshot to the Android activity/UI.
 void notify_ime_state_changed();
 
+// The Android activity was recreated, so cached activity class references are stale.
+void on_activity_recreated();
+
 } // namespace ime
 
 #endif // __ANDROID__

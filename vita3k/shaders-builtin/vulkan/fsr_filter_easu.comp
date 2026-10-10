@@ -36,23 +36,22 @@ uvec4 con3;
 #define A_GPU 1
 #define A_GLSL 1
 
-#define A_HALF
 #include "../../../external/GPUOpen/ffx_a.h"
 layout(set=0,binding=1) uniform texture2D InputTexture;
-layout(set=0,binding=2,rgba16f) uniform image2D OutputTexture;
+layout(set=0,binding=2,rgba8) uniform image2D OutputTexture;
 layout(set=0,binding=3) uniform sampler InputSampler;
-#define FSR_EASU_H 1
-AH4 FsrEasuRH(AF2 p) { AH4 res = AH4(textureGather(sampler2D(InputTexture,InputSampler), p, 0)); return res; }
-AH4 FsrEasuGH(AF2 p) { AH4 res = AH4(textureGather(sampler2D(InputTexture,InputSampler), p, 1)); return res; }
-AH4 FsrEasuBH(AF2 p) { AH4 res = AH4(textureGather(sampler2D(InputTexture,InputSampler), p, 2)); return res; }	
+#define FSR_EASU_F 1
+AF4 FsrEasuRF(AF2 p) { AF4 res = AF4(textureGather(sampler2D(InputTexture,InputSampler), p, 0)); return res; }
+AF4 FsrEasuGF(AF2 p) { AF4 res = AF4(textureGather(sampler2D(InputTexture,InputSampler), p, 1)); return res; }
+AF4 FsrEasuBF(AF2 p) { AF4 res = AF4(textureGather(sampler2D(InputTexture,InputSampler), p, 2)); return res; }	
 
 #include "../../../external/GPUOpen/ffx_fsr1.h"
 
 void CurrFilter(AU2 pos)
 {
-	AH3 c;
-	FsrEasuH(c, pos, con0, con1, con2, con3);
-	imageStore(OutputTexture, ASU2(pos), AH4(c, 1));
+	AF3 c;
+	FsrEasuF(c, pos, con0, con1, con2, con3);
+	imageStore(OutputTexture, ASU2(pos), AF4(c, 1));
 }
 
 layout(local_size_x=64) in;

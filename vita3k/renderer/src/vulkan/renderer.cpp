@@ -612,7 +612,6 @@ bool VKState::create(std::unique_ptr<renderer::State> &state, const Config &conf
             .occlusionQueryPrecise = physical_device_features.occlusionQueryPrecise,
             .fragmentStoresAndAtomics = physical_device_features.fragmentStoresAndAtomics,
             .shaderStorageImageExtendedFormats = physical_device_features.shaderStorageImageExtendedFormats,
-            .shaderInt16 = physical_device_features.shaderInt16,
         };
 
         // look for optional extensions
@@ -638,8 +637,8 @@ bool VKState::create(std::unique_ptr<renderer::State> &state, const Config &conf
             { vk::KHRBufferDeviceAddressExtensionName, &support_buffer_device_address },
             // needed for uniform uvec2 arrays not to take twice the size
             { vk::KHRUniformBufferStandardLayoutExtensionName, &support_standard_layout },
-            // needed for FSR
-            { vk::KHRShaderFloat16Int8ExtensionName, &support_fsr },
+            // Half-precision arithmetic, requested for shaderFloat16 rather than FSR.
+            { vk::KHRShaderFloat16Int8ExtensionName, &support_fp16 },
             // used for accurate programmable blending on desktop GPUs
             { vk::EXTFragmentShaderInterlockExtensionName, &support_shader_interlock },
 #ifdef __APPLE__
@@ -731,11 +730,12 @@ bool VKState::create(std::unique_ptr<renderer::State> &state, const Config &conf
             }
         }
 
-        support_fsr &= static_cast<bool>(physical_device_features.shaderInt16);
-        if (support_fsr) {
-            // double check for FP16 support
+        // The FSR passes run in fp32, so they do not need shaderFloat16 at all - which is what
+        // hid FSR on Android GPUs like Adreno 610. Only support_fp16 depends on it here.
+        support_fp16 &= static_cast<bool>(physical_device_features.shaderInt16);
+        if (support_fp16) {
             auto props = physical_device.getFeatures2KHR<vk::PhysicalDeviceFeatures2, vk::PhysicalDeviceShaderFloat16Int8Features>();
-            support_fsr = static_cast<bool>(props.get<vk::PhysicalDeviceShaderFloat16Int8Features>().shaderFloat16);
+            support_fp16 = static_cast<bool>(props.get<vk::PhysicalDeviceShaderFloat16Int8Features>().shaderFloat16);
         }
 
         if (support_rasterized_order_access) {
@@ -766,7 +766,7 @@ bool VKState::create(std::unique_ptr<renderer::State> &state, const Config &conf
                 vk::PhysicalDeviceUniformBufferStandardLayoutFeatures{
                     .uniformBufferStandardLayout = VK_TRUE },
                 vk::PhysicalDeviceShaderFloat16Int8Features{
-                    // FSR uses float16
+                    // Only for half-precision work unrelated to FSR, which is fp32.
                     .shaderFloat16 = VK_TRUE },
                 vk::PhysicalDeviceFragmentShaderInterlockFeaturesEXT{
                     .fragmentShaderSampleInterlock = VK_TRUE },
@@ -785,7 +785,7 @@ bool VKState::create(std::unique_ptr<renderer::State> &state, const Config &conf
         if (!support_rasterized_order_access)
             device_info.unlink<vk::PhysicalDeviceRasterizationOrderAttachmentAccessFeaturesEXT>();
 
-        if (!support_fsr)
+        if (!support_fp16)
             device_info.unlink<vk::PhysicalDeviceShaderFloat16Int8Features>();
 
         if (!support_shader_interlock)
@@ -913,6 +913,7 @@ bool VKState::create(std::unique_ptr<renderer::State> &state, const Config &conf
         LOG_WARN("Failed to initialize Vulkan overlay renderer, overlays will be disabled");
     }
 
+    support_fsr = true;
     support_fsr &= static_cast<bool>(screen_renderer.surface_capabilities.supportedUsageFlags & vk::ImageUsageFlagBits::eStorage);
 
     return true;
@@ -920,6 +921,25 @@ bool VKState::create(std::unique_ptr<renderer::State> &state, const Config &conf
 
 void VKState::late_init(const Config &cfg, const std::string_view game_id, MemState &mem) {
     this->mem = &mem;
+
+    // PipelineCache reaches shader generation without a config argument.
+    shader_log = cfg.current_config.shader_log;
+
+    // FSR preset. Selecting a preset both lowers the render resolution and turns the
+    // filter on, because FSR at a render scale of 1.0 upscales nothing and would cost
+    // more than it saves.
+    const auto &fsr_preset = fsr_quality_preset(cfg.current_config.fsr_quality_mode);
+    fsr_enabled = cfg.current_config.fsr_quality_mode > 0 && support_fsr;
+    if (fsr_enabled) {
+        res_multiplier = fsr_preset.render_scale;
+        fsr_sharpness = fsr_preset.sharpness;
+        // The preset implies the filter; without this the game would be rendered at a lower
+        // resolution and then displayed with the plain configured filter.
+        screen_renderer.set_filter("FSR");
+        LOG_INFO("FSR enabled in {} mode, rendering at {:.0f}% resolution", fsr_preset.name, fsr_preset.render_scale * 100.f);
+    } else if (cfg.current_config.fsr_quality_mode > 0) {
+        LOG_WARN("FSR '{}' requested but this device does not support it", fsr_preset.name);
+    }
 
     bool use_high_accuracy = cfg.current_config.high_accuracy;
 
@@ -1672,6 +1692,24 @@ static int get_supported_mapping_methods_mask(const vk::PhysicalDevice &gpu, con
     return mask;
 }
 
+// FSR needs to write its intermediate image as a storage image in R8G8B8A8Unorm, the same
+// format the filter allocates. Checked on the physical device rather than on a surface,
+// because the settings screen has no surface yet.
+// An unsupported format/usage combination is reported as an all-zero result, so the extent
+// is the signal - VkImageFormatProperties carries no tiling-feature bitmask.
+static bool gpu_supports_fsr(const vk::PhysicalDevice &gpu, const vk::detail::DispatchLoaderDynamic &dispatch) {
+    try {
+        const vk::ImageFormatProperties properties = gpu.getImageFormatProperties(
+            vk::Format::eR8G8B8A8Unorm, vk::ImageType::e2D, vk::ImageTiling::eOptimal,
+            vk::ImageUsageFlagBits::eStorage, vk::ImageCreateFlags(), dispatch);
+        return properties.maxExtent.width > 0 && properties.maxExtent.height > 0;
+    } catch (const std::exception &) {
+        // An unsupported format/usage combination may surface as an exception rather than a
+        // zeroed result, depending on the binding helper. Either way it means "no".
+        return false;
+    }
+}
+
 renderer::VulkanDeviceInfo renderer::enumerate_vulkan_devices(const std::string &custom_driver_name) {
     VulkanDeviceInfo info;
     info.gpu_names.emplace_back("Automatic");
@@ -1724,6 +1762,7 @@ renderer::VulkanDeviceInfo renderer::enumerate_vulkan_devices(const std::string 
             const vk::PhysicalDeviceProperties properties = gpu.getProperties(dispatch);
             info.gpu_names.emplace_back(properties.deviceName.data());
             info.mapping_method_masks.push_back(get_supported_mapping_methods_mask(gpu, has_properties2, dispatch));
+            info.supports_fsr = info.supports_fsr || gpu_supports_fsr(gpu, dispatch);
         }
 
 #ifdef __ANDROID__

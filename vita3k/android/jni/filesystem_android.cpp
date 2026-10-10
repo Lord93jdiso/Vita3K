@@ -15,11 +15,16 @@
 // with this program; if not, write to the Free Software Foundation, Inc.,
 // 51 Franklin Street, Fifth Floor, Boston, MA 02110-1301 USA.
 
+#include <util/log.h>
+
 #include <SDL3/SDL_system.h>
 #include <SDL3/SDL_timer.h>
 
-#include <atomic>
+#include <chrono>
+#include <condition_variable>
 #include <jni.h>
+#include <memory>
+#include <mutex>
 #include <string>
 #include <vector>
 
@@ -44,34 +49,106 @@ std::string get_error();
 
 } // namespace host::dialog::filesystem
 
-static std::atomic<bool> file_dialog_running = false;
-static fs::path dialog_result_path{};
+namespace {
+
+// The guest thread blocks until the Java side delivers a result through
+// filedialogReturn(). A plain flag plus a polling sleep would either spin the CPU or - if
+// the result never arrives - hang the guest thread forever, so the wait is a condition
+// variable with a timeout instead.
+struct DialogWaitState {
+    std::mutex mutex;
+    std::condition_variable cv;
+    bool completed = false;
+    fs::path result;
+};
+
+constexpr auto dialog_timeout = std::chrono::minutes(5);
+
+DialogWaitState &dialog_wait_state() {
+    static DialogWaitState state;
+    return state;
+}
+
+// Takes the pending result out of the shared state, if there is one.
+fs::path take_dialog_result() {
+    auto &state = dialog_wait_state();
+    std::lock_guard<std::mutex> lock(state.mutex);
+    if (state.result.empty())
+        return fs::path();
+
+    fs::path result = std::move(state.result);
+    state.result.clear();
+    return result;
+}
+
+} // namespace
 
 extern "C" JNIEXPORT void JNICALL
 Java_org_vita3k_emulator_Emulator_filedialogReturn(JNIEnv *env, jobject thiz, jstring result_path) {
-    const char *result_ptr = env->GetStringUTFChars(result_path, nullptr);
-    dialog_result_path = fs::path(result_ptr);
-    env->ReleaseStringUTFChars(result_path, result_ptr);
+    auto &state = dialog_wait_state();
 
-    file_dialog_running.store(false, std::memory_order_release);
+    fs::path path;
+    if (result_path) {
+        const char *result_ptr = env->GetStringUTFChars(result_path, nullptr);
+        if (result_ptr) {
+            path = fs::path(result_ptr);
+            env->ReleaseStringUTFChars(result_path, result_ptr);
+        }
+    }
+
+    {
+        std::lock_guard<std::mutex> lock(state.mutex);
+        state.result = std::move(path);
+        state.completed = true;
+    }
+    state.cv.notify_all();
 }
 
-static void call_dialog_java_function(const char *name, bool need_write) {
+static bool call_dialog_java_function(const char *name, bool need_write) {
     (void)need_write;
 
     JNIEnv *env = reinterpret_cast<JNIEnv *>(SDL_GetAndroidJNIEnv());
     jobject activity = reinterpret_cast<jobject>(SDL_GetAndroidActivity());
-    jclass clazz(env->GetObjectClass(activity));
-    jmethodID method_id = env->GetMethodID(clazz, name, "()V");
+    if (!env || !activity)
+        return false;
 
-    file_dialog_running = true;
+    jclass clazz(env->GetObjectClass(activity));
+    if (!clazz) {
+        LOG_ERROR("Failed to resolve the activity class while opening the '{}' dialog.", name);
+        return false;
+    }
+
+    jmethodID method_id = env->GetMethodID(clazz, name, "()V");
+    if (!method_id) {
+        LOG_ERROR("Activity has no '{}' method, cannot open the dialog.", name);
+        env->DeleteLocalRef(clazz);
+        return false;
+    }
+
+    auto &state = dialog_wait_state();
+    {
+        std::lock_guard<std::mutex> lock(state.mutex);
+        state.result.clear();
+        state.completed = false;
+    }
+
     env->CallVoidMethod(activity, method_id);
 
-    env->DeleteLocalRef(activity);
     env->DeleteLocalRef(clazz);
 
-    while (file_dialog_running.load(std::memory_order_acquire))
-        SDL_Delay(10);
+    std::unique_lock<std::mutex> lock(state.mutex);
+    const bool completed = state.cv.wait_for(lock, dialog_timeout, [&state] {
+        return state.completed;
+    });
+    if (!completed) {
+        state.completed = false;
+        state.result.clear();
+        LOG_ERROR("Timed out waiting for the '{}' dialog result, continuing without a selection.", name);
+        return false;
+    }
+
+    state.completed = false;
+    return true;
 }
 
 namespace host::dialog::filesystem {
@@ -79,20 +156,22 @@ namespace host::dialog::filesystem {
 Result open_file(fs::path &resulting_path, const std::vector<FileFilter> &file_filters, const fs::path &default_path) {
     call_dialog_java_function("showFileDialog", false);
 
-    if (dialog_result_path.empty())
+    const fs::path selected = take_dialog_result();
+    if (selected.empty())
         return Result::CANCEL;
 
-    resulting_path = std::move(dialog_result_path);
+    resulting_path = selected;
     return Result::SUCCESS;
 }
 
 Result pick_folder(fs::path &resulting_path, const fs::path &default_path) {
     call_dialog_java_function("showFolderDialog", true);
 
-    if (dialog_result_path.empty())
+    const fs::path selected = take_dialog_result();
+    if (selected.empty())
         return Result::CANCEL;
 
-    resulting_path = std::move(dialog_result_path);
+    resulting_path = selected;
     return Result::SUCCESS;
 }
 

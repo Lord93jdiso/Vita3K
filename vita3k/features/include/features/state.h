@@ -17,8 +17,15 @@
 
 #pragma once
 
+#include <string>
+
 struct FeatureState {
     bool support_shader_interlock = false; ///< First option for blending. Using this with ordered execution mode.
+    // Extension string to emit when support_shader_interlock is on. The ES and ARB
+    // spellings differ and a GLSL ES compiler rejects the wrong one, so the renderer
+    // records which name the driver actually reported. Empty means "none detected",
+    // in which case the directive is not emitted at all.
+    std::string shader_interlock_extension_name;
     bool support_texture_barrier = false; ///< Second option for blending. Slower but work on 3 vendors.
     bool direct_fragcolor = false;
     bool spirv_shader = false;

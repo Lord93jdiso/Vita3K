@@ -52,8 +52,10 @@ void copy_global_to_current(Config::CurrentConfig &current, const Config &cfg) {
     current.export_as_png = cfg.export_as_png;
     current.fps_hack = cfg.fps_hack;
     current.shader_cache = cfg.shader_cache;
+    current.shader_log = cfg.shader_log;
     current.spirv_shader = cfg.spirv_shader;
     current.texture_cache = cfg.texture_cache;
+    current.fsr_quality_mode = cfg.fsr_quality_mode;
     current.audio_backend = cfg.audio_backend;
     current.audio_volume = cfg.audio_volume;
     current.ngs_enable = cfg.ngs_enable;
@@ -97,8 +99,10 @@ void copy_current_to_global(Config &cfg, const Config::CurrentConfig &current) {
     cfg.export_as_png = current.export_as_png;
     cfg.fps_hack = current.fps_hack;
     cfg.shader_cache = current.shader_cache;
+    cfg.shader_log = current.shader_log;
     cfg.spirv_shader = current.spirv_shader;
     cfg.texture_cache = current.texture_cache;
+    cfg.fsr_quality_mode = current.fsr_quality_mode;
     cfg.audio_backend = current.audio_backend;
     cfg.audio_volume = current.audio_volume;
     cfg.ngs_enable = current.ngs_enable;
@@ -199,8 +203,10 @@ bool load_custom_config(Config::CurrentConfig &out, const fs::path &config_path,
         out.export_as_png = gpu.attribute("export-as-png").as_bool();
         out.fps_hack = gpu.attribute("fps-hack").as_bool();
         out.shader_cache = gpu.attribute("shader-cache").as_bool(true);
+        out.shader_log = gpu.attribute("shader-log").as_bool(false);
         out.spirv_shader = gpu.attribute("spirv-shader").as_bool();
         out.texture_cache = gpu.attribute("texture-cache").as_bool(true);
+        out.fsr_quality_mode = gpu.attribute("fsr-quality-mode").as_int(0);
     }
 
     if (!config_child.child("audio").empty()) {
@@ -236,7 +242,7 @@ bool load_custom_config(Config::CurrentConfig &out, const fs::path &config_path,
         out.log_active_shaders = dbg.attribute("log-active-shaders").as_bool();
         out.log_uniforms = dbg.attribute("log-uniforms").as_bool();
         out.color_surface_debug = dbg.attribute("color-surface-debug").as_bool();
-        out.validation_layer = dbg.attribute("validation-layer").as_bool(true);
+        out.validation_layer = dbg.attribute("validation-layer").as_bool(false);
     }
 
     if (!config_child.child("network").empty())
@@ -287,8 +293,10 @@ bool save_custom_config(const Config::CurrentConfig &cc, const fs::path &config_
     gpu_child.append_attribute("export-as-png") = cc.export_as_png;
     gpu_child.append_attribute("fps-hack") = cc.fps_hack;
     gpu_child.append_attribute("shader-cache") = cc.shader_cache;
+    gpu_child.append_attribute("shader-log") = cc.shader_log;
     gpu_child.append_attribute("spirv-shader") = cc.spirv_shader;
     gpu_child.append_attribute("texture-cache") = cc.texture_cache;
+    gpu_child.append_attribute("fsr-quality-mode") = cc.fsr_quality_mode;
 
     auto audio_child = config_child.append_child("audio");
     audio_child.append_attribute("audio-backend") = cc.audio_backend.c_str();

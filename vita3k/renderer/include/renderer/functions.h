@@ -166,6 +166,10 @@ struct VulkanDeviceInfo {
     std::vector<int> mapping_method_masks;
     bool custom_driver_requested = false;
     bool custom_driver_loaded = false;
+    // Whether a GPU in this enumeration can run the FSR screen filter. Queried here because
+    // the settings screen is shown without a live renderer: emuenv.renderer only exists
+    // while a game session is running, so asking the renderer there would always say no.
+    bool supports_fsr = false;
 };
 
 VulkanDeviceInfo enumerate_vulkan_devices(const std::string &custom_driver_name = {});

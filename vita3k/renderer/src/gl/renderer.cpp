@@ -41,7 +41,9 @@
 #endif
 
 #include <array>
+#include <functional>
 #include <mutex>
+#include <string>
 #include <string_view>
 
 namespace renderer::gl {
@@ -202,23 +204,67 @@ bool create(std::unique_ptr<State> &state, const Config &config) {
     int total_extensions = 0;
     glGetIntegerv(GL_NUM_EXTENSIONS, &total_extensions);
 
+    // Each feature lists every extension string that can provide it. The ES spellings differ
+    // from the ARB ones, so checking only the desktop names left the interlock and texture
+    // barrier paths permanently disabled on Android GLES.
     std::unordered_map<std::string, bool *> check_extensions = {
         { "GL_ARB_fragment_shader_interlock", &gl_state.features.support_shader_interlock },
+        { "GL_EXT_fragment_shader_interlock", &gl_state.features.support_shader_interlock },
+        { "GL_NV_fragment_shader_interlock", &gl_state.features.support_shader_interlock },
         { "GL_ARB_texture_barrier", &gl_state.features.support_texture_barrier },
+        // GL_NV_texture_barrier is deliberately NOT listed: the draw path calls
+        // glTextureBarrier() through glad, and there is no guarantee the GLES loader
+        // resolves it, so enabling the feature could call a null pointer. Shader interlock
+        // is safe to enable because its barrier uses core glMemoryBarrier.
         { "GL_EXT_shader_framebuffer_fetch", &gl_state.features.direct_fragcolor },
         { "GL_ARB_gl_spirv", &gl_state.features.spirv_shader },
         { "GL_ARB_get_texture_sub_image", &gl_state.features.support_get_texture_sub_image },
         { "GL_EXT_shader_image_load_formatted", &gl_state.features.support_unknown_format }
     };
 
+    // Recorded so the generated GLSL asks for the spelling the driver actually knows.
+    std::string shader_interlock_extension;
+
     for (int i = 0; i < total_extensions; i++) {
-        const std::string extension = reinterpret_cast<const GLchar *>(glGetStringi(GL_EXTENSIONS, i));
+        const char *extension_ptr = reinterpret_cast<const GLchar *>(glGetStringi(GL_EXTENSIONS, i));
+        if (!extension_ptr)
+            continue;
+
+        const std::string extension = extension_ptr;
         auto find_result = check_extensions.find(extension);
 
         if (find_result != check_extensions.end()) {
-            *find_result->second = true;
+            // Read the target before erasing: erase invalidates the iterator, so touching
+            // find_result->second afterwards would be a use-after-free.
+            bool *feature_flag = find_result->second;
+            *feature_flag = true;
             check_extensions.erase(find_result);
+
+            if (feature_flag == &gl_state.features.support_shader_interlock && shader_interlock_extension.empty())
+                shader_interlock_extension = extension;
         }
+    }
+
+    if (!shader_interlock_extension.empty())
+        gl_state.features.shader_interlock_extension_name = shader_interlock_extension;
+
+    // Generated shaders always declare every varying the GXM can produce as a vec4 (only
+    // PSIZE is narrowed), so a game using several texcoord and colour outputs needs close
+    // to the whole ES 3.2 guaranteed minimum. Mobile drivers that report exactly the
+    // minimum would fail to link, and nothing in the translator knows the device limits,
+    // so they are reported here to make such a failure diagnosable from the log.
+    GLint max_varying_vectors = 0;
+    glGetIntegerv(GL_MAX_VARYING_VECTORS, &max_varying_vectors);
+    GLint max_combined_texture_image_units = 0;
+    glGetIntegerv(GL_MAX_COMBINED_TEXTURE_IMAGE_UNITS, &max_combined_texture_image_units);
+    LOG_INFO("GL limits: varying vectors = {}, combined texture image units = {}",
+        static_cast<int>(max_varying_vectors), static_cast<int>(max_combined_texture_image_units));
+
+    // Sampler bindings run up to SCE_GXM_MAX_TEXTURE_UNITS (16) plus the same again for
+    // vertex samplers, which lands exactly on the ES 3.2 guaranteed minimum.
+    if (max_varying_vectors > 0 && max_varying_vectors < 15) {
+        LOG_WARN("GPU reports only {} varying vectors; shaders using several texcoord and colour outputs may fail to link.",
+            static_cast<int>(max_varying_vectors));
     }
 
     if (gl_state.features.direct_fragcolor) {
@@ -829,6 +875,55 @@ std::string_view GLState::get_gpu_name() {
     const char *gl_renderer = reinterpret_cast<const char *>(glGetString(GL_RENDERER));
     gl_renderer = gl_renderer ? gl_renderer : "Unknown";
     return gl_renderer;
+}
+
+uint32_t GLState::get_features_mask() {
+    // Ten feature bits leave room for the extension tag. The tag only has to distinguish
+    // the three interlock spellings, so it is a small enum rather than a hash: a wide hash
+    // field would overflow the union and split it across two words.
+    union {
+        struct {
+            bool support_shader_interlock : 1;
+            bool support_texture_barrier : 1;
+            bool direct_fragcolor : 1;
+            bool spirv_shader : 1;
+            bool support_get_texture_sub_image : 1;
+            bool preserve_f16_nan_as_u16 : 1;
+            bool support_unknown_format : 1;
+            bool support_rgb_attributes : 1;
+            bool use_mask_bit : 1;
+            bool support_scaled_attribute_formats : 1;
+            uint32_t interlock_extension_tag : 22;
+        };
+        uint32_t value;
+    } features_mask;
+    static_assert(sizeof(features_mask) == sizeof(uint32_t));
+
+    const auto &name = features.shader_interlock_extension_name;
+    uint32_t interlock_extension_tag = 0;
+    if (name == "GL_EXT_fragment_shader_interlock")
+        interlock_extension_tag = 2;
+    else if (name == "GL_NV_fragment_shader_interlock")
+        interlock_extension_tag = 3;
+    else if (!name.empty())
+        interlock_extension_tag = 1;
+
+    features_mask.value = 0;
+    features_mask.support_shader_interlock = features.support_shader_interlock;
+    features_mask.support_texture_barrier = features.support_texture_barrier;
+    features_mask.direct_fragcolor = features.direct_fragcolor;
+    features_mask.spirv_shader = features.spirv_shader;
+    features_mask.support_get_texture_sub_image = features.support_get_texture_sub_image;
+    features_mask.preserve_f16_nan_as_u16 = features.preserve_f16_nan_as_u16;
+    features_mask.support_unknown_format = features.support_unknown_format;
+    features_mask.support_rgb_attributes = features.support_rgb_attributes;
+    features_mask.use_mask_bit = features.use_mask_bit;
+    features_mask.support_scaled_attribute_formats = features.support_scaled_attribute_formats;
+    // Which extension spelling was detected changes the generated GLSL, so a device switch
+    // between the ARB and ES forms must not reuse the other one's cached source.
+    features_mask.interlock_extension_tag = interlock_extension_tag;
+
+    return features_mask.value;
 }
 
 void GLState::precompile_shader(const ShadersHash &hash) {

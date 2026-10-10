@@ -9,6 +9,7 @@ import android.content.Intent
 import android.os.Build
 import android.os.IBinder
 import android.os.PowerManager
+import android.os.SystemClock
 import androidx.core.app.NotificationCompat
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
@@ -25,6 +26,8 @@ class InstallForegroundService : Service() {
     private val serviceScope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
     private var wakeLock: PowerManager.WakeLock? = null
     private var activeOperationId: Long = 0L
+    private var lastNotifiedStatus: String? = null
+    private var lastNotificationAtMs: Long = 0L
 
     override fun onBind(intent: Intent?): IBinder? = null
 
@@ -58,6 +61,8 @@ class InstallForegroundService : Service() {
         serviceScope.launch {
             val result = runOperation(operationId, operationType, intent)
             InstallServiceController.finish(operationId, result)
+            // Bypass the throttle so the final state is always shown.
+            lastNotifiedStatus = null
             updateNotification(result.message)
             releaseWakeLock()
             stopForeground(STOP_FOREGROUND_REMOVE)
@@ -273,6 +278,17 @@ class InstallForegroundService : Service() {
 
     private fun onProgress(operationId: Long, percent: Int, status: String) {
         InstallServiceController.updateProgress(operationId, percent, status)
+
+        // Installing a folder reports progress per file inside every archive, so the same
+        // status reaches this point in bursts. Each notify() is a binder call into
+        // system_server, so it is rate limited to keep an install from flooding it.
+        val now = SystemClock.elapsedRealtime()
+        val unchanged = lastNotifiedStatus == status
+        if (unchanged && now - lastNotificationAtMs < NOTIFICATION_THROTTLE_MS) {
+            return
+        }
+        lastNotifiedStatus = status
+        lastNotificationAtMs = now
         updateNotification(status)
     }
 
@@ -367,5 +383,6 @@ class InstallForegroundService : Service() {
         private const val NOTIFICATION_CHANNEL_ID = "install_progress"
         private const val NOTIFICATION_ID = 0x317
         private const val WAKE_LOCK_TIMEOUT_MS = 6L * 60L * 60L * 1000L
+        private const val NOTIFICATION_THROTTLE_MS = 250L
     }
 }

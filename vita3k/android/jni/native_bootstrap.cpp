@@ -36,6 +36,7 @@
 #include <sys/system_properties.h>
 
 #include <filesystem>
+#include <mutex>
 #include <span>
 #include <vector>
 
@@ -181,6 +182,10 @@ JNIEXPORT jboolean JNICALL
 Java_org_vita3k_emulator_NativeLib_init(JNIEnv *env, jclass, jstring storage_path_str) {
     auto &session = android_session_state();
 
+    // The frontend initialises from Dispatchers.IO while a direct Emulator start does
+    // it on the UI thread, so the check and the construction must be atomic together.
+    std::lock_guard<std::mutex> init_lock(session.init_mutex);
+
     if (session.emuenv) {
         LOG_INFO("Vita3K Android already initialised, skipping.");
         return JNI_TRUE;
@@ -203,7 +208,9 @@ Java_org_vita3k_emulator_NativeLib_init(JNIEnv *env, jclass, jstring storage_pat
 
 JNIEXPORT jboolean JNICALL
 Java_org_vita3k_emulator_NativeLib_isInitialized(JNIEnv *, jclass) {
-    return get_emuenv() ? JNI_TRUE : JNI_FALSE;
+    auto &session = android_session_state();
+    std::lock_guard<std::mutex> init_lock(session.init_mutex);
+    return session.emuenv ? JNI_TRUE : JNI_FALSE;
 }
 
 JNIEXPORT jboolean JNICALL
@@ -217,6 +224,8 @@ Java_org_vita3k_emulator_NativeLib_refreshAppsList(JNIEnv *, jclass) {
     if (!emuenv)
         return;
 
+    // The list contents changed, so the cached per-app info no longer applies.
+    invalidate_app_info_cache();
     app::scan_apps(*emuenv);
 }
 

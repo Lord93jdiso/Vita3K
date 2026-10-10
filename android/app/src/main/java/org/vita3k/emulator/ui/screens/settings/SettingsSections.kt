@@ -33,6 +33,7 @@ import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
 import org.vita3k.emulator.R
 import org.vita3k.emulator.ConnectedGamepad
+import org.vita3k.emulator.NativeLib
 import org.vita3k.emulator.data.CustomDriverLoadStatus
 import org.vita3k.emulator.data.EmulatorConfig
 import org.vita3k.emulator.data.FirmwareLinks
@@ -436,11 +437,77 @@ private fun CoreSettingsSection(
         }
     }
 
+    // FSR needs the Vulkan renderer, and the native side reports whether this device can
+    // actually run it. Queried once per composition rather than on every recomposition.
+    @Composable
+    private fun FsrQualitySection(
+        cfg: EmulatorConfig,
+        isVulkan: Boolean,
+        onUpdate: (EmulatorConfig.() -> Unit) -> Unit,
+        onShowHelp: (SettingsHelpEntry) -> Unit
+    ) {
+        val supported = remember(isVulkan) {
+            if (!isVulkan) {
+                emptyList()
+            } else {
+                runCatching { NativeLib.getFsrRenderScales().toList() }
+                    .getOrDefault(emptyList())
+                    .takeIf { it.isNotEmpty() }
+                    ?: emptyList()
+            }
+        }
+
+        val title = stringResource(R.string.settings_fsr_title)
+        val description = stringResource(R.string.settings_fsr_desc)
+
+        if (supported.isEmpty()) {
+            SettingsToggleRow(
+                title = title,
+                checked = false,
+                enabled = false,
+                onCheckedChange = {},
+                summary = stringResource(R.string.settings_fsr_unsupported),
+                help = SettingsHelpEntry(title = title, body = description),
+                onShowHelp = onShowHelp
+            )
+            return
+        }
+
+        val modeLabels = listOf(
+            stringResource(R.string.settings_fsr_off),
+            stringResource(R.string.settings_fsr_ultra_quality),
+            stringResource(R.string.settings_fsr_quality),
+            stringResource(R.string.settings_fsr_performance),
+            stringResource(R.string.settings_fsr_extreme)
+        )
+        val labels = modeLabels.take(supported.size)
+
+        // The selected mode also drives the internal render scale, so the slider has to follow
+        // it instead of the other way round: picking a preset is what changes the resolution.
+        val selected = cfg.fsrQualityMode.coerceIn(0, labels.lastIndex)
+        val scale = supported.getOrNull(selected) ?: 100
+
+        SettingsChoiceField(
+            title = title,
+            options = labels,
+            selectedIndex = selected,
+            // Only the preset is stored. The native side applies the matching render scale when
+            // a preset is active, so writing resolutionMultiplier here as well would silently
+            // overwrite the separate internal-resolution setting whenever FSR is switched off.
+            onSelect = { index -> onUpdate { fsrQualityMode = index } },
+            help = SettingsHelpEntry(
+                title = title,
+                body = description + "\n\n" + stringResource(R.string.settings_fsr_scale, scale)
+            ),
+            onShowHelp = onShowHelp
+        )
+    }
+
     @OptIn(ExperimentalLayoutApi::class)
     @Composable
-private fun GpuSettingsSection(
-    cfg: EmulatorConfig,
-    isPerApp: Boolean,
+    private fun GpuSettingsSection(
+        cfg: EmulatorConfig,
+        isPerApp: Boolean,
     supportedMemoryMappingMask: Int,
     customDriverLoadStatus: CustomDriverLoadStatus,
     installedCustomDrivers: List<String>,
@@ -490,6 +557,7 @@ private fun GpuSettingsSection(
                 help = screenFilterHelp,
                 onShowHelp = onShowHelp
             )
+            FsrQualitySection(cfg = cfg, isVulkan = isVulkan, onUpdate = onUpdate, onShowHelp = onShowHelp)
             if (isVulkan) {
                 val accuracyTitle = stringResource(R.string.settings_gpu_accuracy)
                 val accuracyHelp = helpEntry(accuracyTitle, stringResource(R.string.settings_gpu_accuracy_desc))
@@ -753,7 +821,20 @@ private fun GpuSettingsSection(
                 ),
                 onShowHelp = onShowHelp
             )
-            if (isVulkan) {
+            SettingsToggleRow(
+                title = stringResource(R.string.settings_gpu_shader_log),
+                checked = cfg.shaderLog,
+                onCheckedChange = { onUpdate { shaderLog = it } },
+                help = SettingsHelpEntry(
+                    title = stringResource(R.string.settings_gpu_shader_log),
+                    body = stringResource(R.string.settings_gpu_shader_log_desc)
+                ),
+                onShowHelp = onShowHelp
+            )
+            if (!isVulkan) {
+                // Only the GL renderer reads this: it feeds glShaderBinary, which is
+                // GL_ARB_gl_spirv. The Vulkan path always consumes the generated SPIR-V and
+                // ignores the setting, so showing it there was backwards.
                 SettingsToggleRow(
                     title = stringResource(R.string.settings_gpu_spirv_shader),
                     checked = cfg.spirvShader,

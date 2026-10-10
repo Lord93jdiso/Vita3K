@@ -2019,8 +2019,10 @@ static std::string convert_spirv_to_glsl(const std::string &shader_name, SpirvCo
     if (translation_state.frag_coord_id != spv::NoResult) {
         glsl.set_remapped_variable_state(translation_state.frag_coord_id, true);
     }
-    if (features.support_shader_interlock) {
-        glsl.require_extension("GL_ARB_fragment_shader_interlock");
+    if (features.support_shader_interlock && !features.shader_interlock_extension_name.empty()) {
+        // The name the driver reported, not a hardcoded ARB one: an ES profile compiler
+        // rejects GL_ARB_fragment_shader_interlock outright.
+        glsl.require_extension(features.shader_interlock_extension_name);
     }
     // Compile to GLSL, ready to give to GL driver.
     std::string source = glsl.compile();
@@ -2117,6 +2119,9 @@ void convert_gxp_to_glsl_from_filepath(const std::string &shader_filepath_utf8) 
 
     FeatureState features{
         .support_shader_interlock = true,
+        // This standalone tool has no renderer to report a real extension string, and the
+        // desktop spelling is the safe default for it.
+        .shader_interlock_extension_name = "GL_ARB_fragment_shader_interlock",
         .direct_fragcolor = false
     };
 

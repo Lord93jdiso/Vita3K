@@ -29,6 +29,8 @@ class EmulatorConfig {
     @JvmField var fpsHack: Boolean = false
     @JvmField var turboMode: Boolean = false
     @JvmField var shaderCache: Boolean = true
+    @JvmField var shaderLog: Boolean = false
+    @JvmField var fsrQualityMode: Int = 0
     @JvmField var spirvShader: Boolean = false
     @JvmField var customDriverName: String = ""
 
@@ -78,7 +80,7 @@ class EmulatorConfig {
     @JvmField var logUniforms: Boolean = false
     @JvmField var colorSurfaceDebug: Boolean = false
     @JvmField var dumpElfs: Boolean = false
-    @JvmField var validationLayer: Boolean = true
+    @JvmField var validationLayer: Boolean = false
     @JvmField var textureCache: Boolean = true
     @JvmField var stretchDisplayArea: Boolean = false
     @JvmField var fullscreenHdResPixelPerfect: Boolean = false
@@ -116,6 +118,8 @@ class EmulatorConfig {
         config.fpsHack = fpsHack
         config.turboMode = turboMode
         config.shaderCache = shaderCache
+        config.shaderLog = shaderLog
+        config.fsrQualityMode = fsrQualityMode
         config.spirvShader = spirvShader
         config.customDriverName = customDriverName
         config.audioBackend = audioBackend
@@ -195,6 +199,8 @@ class EmulatorConfig {
             fpsHack == other.fpsHack &&
             turboMode == other.turboMode &&
             shaderCache == other.shaderCache &&
+            shaderLog == other.shaderLog &&
+            fsrQualityMode == other.fsrQualityMode &&
             spirvShader == other.spirvShader &&
             customDriverName == other.customDriverName &&
             audioBackend == other.audioBackend &&
@@ -271,6 +277,8 @@ class EmulatorConfig {
         result = 31 * result + fpsHack.hashCode()
         result = 31 * result + turboMode.hashCode()
         result = 31 * result + shaderCache.hashCode()
+        result = 31 * result + shaderLog.hashCode()
+        result = 31 * result + fsrQualityMode
         result = 31 * result + spirvShader.hashCode()
         result = 31 * result + customDriverName.hashCode()
         result = 31 * result + audioBackend.hashCode()

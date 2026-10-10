@@ -23,17 +23,74 @@
 #include <io/state.h>
 #include <util/log.h>
 
+#include <mutex>
+
+namespace {
+
+// Resolved once: these are looked up by name on every apps-list refresh.
+struct AppListJniCache {
+    std::mutex mutex;
+    jclass app_info_class = nullptr;
+    jmethodID app_info_ctor = nullptr;
+};
+
+AppListJniCache &app_list_jni() {
+    static AppListJniCache cache;
+    return cache;
+}
+
+bool ensure_app_list_jni(JNIEnv *env) {
+    auto &cache = app_list_jni();
+    {
+        std::lock_guard<std::mutex> lock(cache.mutex);
+        if (cache.app_info_class)
+            return true;
+    }
+
+    jclass local_class = env->FindClass("org/vita3k/emulator/data/NativeAppInfo");
+    if (!local_class)
+        return false;
+
+    jmethodID ctor = env->GetMethodID(local_class, "<init>",
+        "(Ljava/lang/String;Ljava/lang/String;Ljava/lang/String;Ljava/lang/String;Ljava/lang/String;ZIJJ)V");
+    if (!ctor) {
+        env->DeleteLocalRef(local_class);
+        return false;
+    }
+
+    jclass global_class = reinterpret_cast<jclass>(env->NewGlobalRef(local_class));
+    env->DeleteLocalRef(local_class);
+
+    std::lock_guard<std::mutex> lock(cache.mutex);
+    if (cache.app_info_class) {
+        // Another thread won the race; keep its result and drop ours.
+        if (global_class)
+            env->DeleteGlobalRef(global_class);
+        return true;
+    }
+
+    cache.app_info_ctor = ctor;
+    cache.app_info_class = global_class;
+    return cache.app_info_class != nullptr;
+}
+
+} // namespace
+
 extern "C" {
 
 JNIEXPORT jobjectArray JNICALL
 Java_org_vita3k_emulator_NativeLib_getAppListDetailed(JNIEnv *env, jclass) {
-    jclass app_info_class = env->FindClass("org/vita3k/emulator/data/NativeAppInfo");
-    if (!app_info_class)
+    if (!ensure_app_list_jni(env))
         return nullptr;
 
-    jmethodID ctor = env->GetMethodID(app_info_class, "<init>", "(Ljava/lang/String;Ljava/lang/String;Ljava/lang/String;Ljava/lang/String;Ljava/lang/String;ZIJJ)V");
-    if (!ctor)
-        return env->NewObjectArray(0, app_info_class, nullptr);
+    jclass app_info_class = nullptr;
+    jmethodID ctor = nullptr;
+    {
+        auto &cache = app_list_jni();
+        std::lock_guard<std::mutex> lock(cache.mutex);
+        app_info_class = cache.app_info_class;
+        ctor = cache.app_info_ctor;
+    }
 
     auto *emuenv = get_emuenv();
     if (!emuenv)
@@ -90,15 +147,8 @@ Java_org_vita3k_emulator_NativeLib_getAppListDetailed(JNIEnv *env, jclass) {
     return result;
 }
 
-JNIEXPORT jboolean JNICALL
-Java_org_vita3k_emulator_NativeLib_performAppAction(JNIEnv *env, jclass, jstring title_id_str, jint action_bit) {
-    auto *emuenv = get_emuenv();
-    auto *controller = get_app_session_controller();
-    if (!emuenv)
-        return JNI_FALSE;
-
-    const std::string title_id = jstring_to_string(env, title_id_str);
-
+static jboolean perform_app_action_bit(EmuEnvState *emuenv, app::AppSessionController *controller,
+    const std::string &title_id, const jint action_bit) {
     switch (static_cast<uint32_t>(action_bit)) {
     case ACTION_DELETE_APPLICATION: {
         if (controller && controller->has_active_session())
@@ -165,6 +215,21 @@ Java_org_vita3k_emulator_NativeLib_performAppAction(JNIEnv *env, jclass, jstring
     }
 }
 
+JNIEXPORT jboolean JNICALL
+Java_org_vita3k_emulator_NativeLib_performAppAction(JNIEnv *env, jclass, jstring title_id_str, jint action_bit) {
+    auto *emuenv = get_emuenv();
+    if (!emuenv)
+        return JNI_FALSE;
+
+    const std::string title_id = jstring_to_string(env, title_id_str);
+
+    // Every branch below mutates paths that the cached action mask and install size are
+    // derived from, so the cache is dropped regardless of the outcome.
+    const jboolean result = perform_app_action_bit(emuenv, get_app_session_controller(), title_id, action_bit);
+    invalidate_app_info_cache();
+    return result;
+}
+
 JNIEXPORT jint JNICALL
 Java_org_vita3k_emulator_NativeLib_getAppActionAvailabilityMask(JNIEnv *env, jclass, jstring title_id_str) {
     auto *emuenv = get_emuenv();
@@ -187,20 +252,9 @@ Java_org_vita3k_emulator_NativeLib_getAppInstallSize(JNIEnv *env, jclass, jstrin
         return 0L;
 
     const auto app_path = emuenv->vita_fs_path / "ux0/app" / app->path;
-    if (!fs::exists(app_path))
-        return 0L;
-
-    try {
-        uintmax_t size = 0;
-        for (const auto &entry : fs::recursive_directory_iterator(app_path, fs::directory_options::skip_permission_denied)) {
-            if (entry.is_regular_file())
-                size += fs::file_size(entry.path());
-        }
-        return static_cast<jlong>(size);
-    } catch (const std::exception &error) {
-        LOG_WARN("Failed to compute install size for {}: {}", title_id, error.what());
-        return 0L;
-    }
+    // Walking the whole app directory costs hundreds of milliseconds on a large install,
+    // so the first result is cached and reused until something invalidates it.
+    return static_cast<jlong>(get_app_install_size(title_id, app_path));
 }
 
 } // extern "C"

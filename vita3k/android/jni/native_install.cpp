@@ -43,6 +43,7 @@ Java_org_vita3k_emulator_NativeLib_installFirmware(JNIEnv *env, jclass, jstring 
     const std::string version = install_pup(emuenv->vita_fs_path, fs::path(path), progress_fn);
     if (!version.empty()) {
         LOG_INFO("Firmware {} installed successfully", version);
+        invalidate_app_info_cache();
         app::scan_apps(*emuenv);
     } else {
         LOG_ERROR("Firmware installation failed for: {}", path);
@@ -68,6 +69,7 @@ Java_org_vita3k_emulator_NativeLib_installPkg(JNIEnv *env, jclass, jstring path_
     const bool success = install_pkg(fs::path(path), *emuenv, zrif, progress_fn);
     if (success) {
         LOG_INFO("PKG installed successfully");
+        invalidate_app_info_cache();
         app::scan_apps(*emuenv);
     } else {
         LOG_ERROR("PKG installation failed for: {} (zRIF {})", path, zrif.empty() ? "not provided" : "provided");
@@ -97,8 +99,11 @@ Java_org_vita3k_emulator_NativeLib_installArchive(JNIEnv *env, jclass, jstring p
 
     const auto reinstall_fn = [force_reinstall](const std::string &, const std::string &) -> bool { return static_cast<bool>(force_reinstall); };
     const auto result = install_archive(*emuenv, fs::path(path), progress_fn, reinstall_fn);
-    if (!result.empty())
+    if (!result.empty()) {
+        // A new app landed on disk, so cached install sizes and action masks are stale.
+        invalidate_app_info_cache();
         app::scan_apps(*emuenv);
+    }
 
     return result.empty() ? JNI_FALSE : JNI_TRUE;
 }

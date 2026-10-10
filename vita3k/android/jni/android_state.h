@@ -34,6 +34,9 @@ struct AndroidSessionState {
     std::unique_ptr<EmuEnvState> emuenv;
     std::unique_ptr<app::AppSessionController> app_session_controller;
     Root root_paths;
+    // Guards one-time creation of the singleton above, which can be reached
+    // concurrently from the Kotlin IO dispatcher and the UI thread.
+    std::mutex init_mutex;
 };
 
 AndroidSessionState &android_session_state();
@@ -68,6 +71,11 @@ bool remove_path_if_exists(const fs::path &path);
 void attach_overlay_virtual_controller();
 void detach_overlay_virtual_controller();
 
+// Per-app data derived by walking the filesystem (install size, action availability).
+// Those walks are far too slow for the UI to trigger directly, so results are cached
+// and this must be called whenever anything that could change them does.
+void invalidate_app_info_cache();
+
 enum AppActionMask : uint32_t {
     ACTION_DELETE_APPLICATION = 1u << 0,
     ACTION_DELETE_SAVE_DATA = 1u << 1,
@@ -82,3 +90,6 @@ enum AppActionMask : uint32_t {
 };
 
 uint32_t get_app_action_availability_mask(const std::string &title_id);
+
+// Total on-disk size of an installed app, cached per title id.
+uint64_t get_app_install_size(const std::string &title_id, const fs::path &app_path);

@@ -84,8 +84,13 @@ struct Config {
         bool export_as_png = false;
         bool fps_hack = false;
         bool shader_cache = true;
+        bool shader_log = false;
         bool spirv_shader = false;
         bool texture_cache = true;
+        // FSR quality preset: 0 = off, 1 = Ultra Quality, 2 = Quality,
+        // 3 = Performance, 4 = Extreme. Each preset picks the render scale that FSR
+        // upscales from, so this is what makes FSR actually save anything.
+        int fsr_quality_mode = 0;
         bool stretch_the_display_area = false;
         bool fullscreen_hd_res_pixel_perfect = false;
         int file_loading_delay = 0;

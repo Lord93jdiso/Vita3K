@@ -27,10 +27,30 @@
 #include <cstdio>
 #include <cstring>
 #include <exception>
+#include <mutex>
+#include <unordered_map>
+#include <utility>
 
 namespace {
 
 AndroidSessionState session_state;
+
+// Progress reporting state. The install loops report per file and per PFS chunk, and each
+// callback allocates a jstring before hopping to Java, which pushes it into a foreground
+// service notification - a binder call into system_server. Status text is almost always a
+// handful of fixed strings, so the matching jstring is cached as a global ref and reused.
+struct ProgressCache {
+    std::mutex mutex;
+    bool has_last = false;
+    int last_percent = -1;
+    std::string last_status;
+    jstring jstatus = nullptr;
+};
+
+ProgressCache &progress_cache() {
+    static ProgressCache cache;
+    return cache;
+}
 
 } // namespace
 
@@ -155,6 +175,19 @@ ScopedJniCallback::~ScopedJniCallback() {
     env->DeleteGlobalRef(callback_);
     callback_ = nullptr;
 
+    // Drop the cached status string so it is not leaked into the next install.
+    auto &cache = progress_cache();
+    {
+        std::lock_guard<std::mutex> lock(cache.mutex);
+        if (cache.jstatus) {
+            env->DeleteGlobalRef(cache.jstatus);
+            cache.jstatus = nullptr;
+        }
+        cache.has_last = false;
+        cache.last_percent = -1;
+        cache.last_status.clear();
+    }
+
     if (attached)
         java_vm_->DetachCurrentThread();
 }
@@ -163,14 +196,182 @@ void ScopedJniCallback::call_progress(int percent, const char *status) const {
     if (!callback_ || !method_ || !env_)
         return;
 
-    jstring jstatus = env_->NewStringUTF(status);
-    env_->CallVoidMethod(callback_, method_, static_cast<jint>(percent), jstatus);
-    env_->DeleteLocalRef(jstatus);
+    const int clamped = std::clamp(percent, 0, 100);
+    const std::string status_text = status ? status : "";
 
-    if (env_->ExceptionCheck()) {
+    jstring arg = nullptr;
+    // Owned by this function alone. The cached global ref is never handed to Java directly:
+    // the cache is process-wide and another install finishing could delete it while this
+    // thread is still inside CallVoidMethod.
+    {
+        auto &cache = progress_cache();
+        std::lock_guard<std::mutex> lock(cache.mutex);
+
+        // Consecutive ticks carrying the same value are common - a per-file loop over a
+        // large archive reports them constantly - and each one used to cost a jstring
+        // allocation plus a notification update in system_server.
+        if (cache.has_last && cache.last_percent == clamped && cache.last_status == status_text)
+            return;
+
+        arg = env_->NewStringUTF(status_text.c_str());
+
+        if (cache.jstatus) {
+            env_->DeleteGlobalRef(cache.jstatus);
+            cache.jstatus = nullptr;
+        }
+        if (arg)
+            cache.jstatus = reinterpret_cast<jstring>(env_->NewGlobalRef(arg));
+    }
+
+    // Outside the lock: the Java callback can re-enter the emulator through other JNI
+    // entry points that take this same mutex.
+    if (!arg) {
+        // Out of memory. The tick is not recorded, so the next one with the same values
+        // still reaches the listener instead of being swallowed as a duplicate.
+        return;
+    }
+
+    env_->CallVoidMethod(callback_, method_, static_cast<jint>(clamped), arg);
+
+    const bool threw = env_->ExceptionCheck() != JNI_FALSE;
+
+    env_->DeleteLocalRef(arg);
+
+    if (threw) {
         env_->ExceptionDescribe();
         env_->ExceptionClear();
+
+        // The listener threw, so it is no longer usable: drop the cached string and stop
+        // remembering the last tick, which makes the next call retry the listener once and
+        // then give up quietly if it throws again.
+        auto &cache = progress_cache();
+        std::lock_guard<std::mutex> lock(cache.mutex);
+        if (cache.jstatus) {
+            env_->DeleteGlobalRef(cache.jstatus);
+            cache.jstatus = nullptr;
+        }
+        cache.has_last = false;
+        cache.last_percent = -1;
+        cache.last_status.clear();
+        return;
     }
+
+    auto &cache = progress_cache();
+    std::lock_guard<std::mutex> lock(cache.mutex);
+    cache.has_last = true;
+    cache.last_percent = clamped;
+    cache.last_status = status_text;
+}
+
+namespace {
+
+// Title-id index over the apps list. app::get_apps() returns the whole vector by value
+// under a mutex, and find_app_by_title_id is called per list item on every long-press and
+// per info sheet, so the copy added up.
+struct AppsIndex {
+    std::mutex mutex;
+    std::unordered_map<std::string, app::AppEntry> by_title_id;
+    // Which user generation the index was built for.
+    std::string user_id;
+};
+
+AppsIndex &apps_index() {
+    static AppsIndex index;
+    return index;
+}
+
+// Filesystem-derived per-app values, keyed by title id. Cleared wholesale whenever
+// something changes the paths they were derived from.
+struct AppInfoCache {
+    std::mutex mutex;
+    std::unordered_map<std::string, uint32_t> action_mask;
+    std::unordered_map<std::string, uint64_t> install_size;
+};
+
+AppInfoCache &app_info_cache() {
+    static AppInfoCache cache;
+    return cache;
+}
+
+// Returning a reference into the index would outlive the lock, and the caller reads it
+// after this function returns while another thread may be rebuilding the map.
+std::optional<app::AppEntry> lookup_app_by_title_id(const EmuEnvState &emuenv, const std::string &title_id) {
+    auto &index = apps_index();
+    std::lock_guard<std::mutex> lock(index.mutex);
+
+    const auto &list = emuenv.app.apps_list;
+    // The list is copied under its own mutex, matching how app::get_apps() does it. A
+    // reference into it must not escape this scope, hence the copy below.
+    std::lock_guard<std::mutex> list_lock(list.mutex);
+
+    // Rebuilt when the list size or the active user changes; app paths and titles are
+    // otherwise stable for a session.
+    if (index.by_title_id.size() != list.apps.size() || index.user_id != emuenv.io.user_id) {
+        std::unordered_map<std::string, app::AppEntry> rebuilt;
+        rebuilt.reserve(list.apps.size());
+        for (const auto &entry : list.apps) {
+            rebuilt.emplace(entry.title_id, entry);
+        }
+        index.by_title_id = std::move(rebuilt);
+        index.user_id = emuenv.io.user_id;
+    }
+
+    const auto it = index.by_title_id.find(title_id);
+    if (it == index.by_title_id.end())
+        return std::nullopt;
+
+    return it->second;
+}
+
+} // namespace
+
+void invalidate_app_info_cache() {
+    {
+        auto &cache = app_info_cache();
+        std::lock_guard<std::mutex> lock(cache.mutex);
+        cache.action_mask.clear();
+        cache.install_size.clear();
+    }
+
+    // The apps list itself is about to change, so the index has to be dropped as well.
+    // Comparing list sizes is not enough: deleting one app and installing another keeps
+    // the count identical while every entry in the index becomes stale.
+    auto &index = apps_index();
+    std::lock_guard<std::mutex> lock(index.mutex);
+    index.by_title_id.clear();
+}
+
+// Cached install size for an app, computed on first request.
+uint64_t get_app_install_size(const std::string &title_id, const fs::path &app_path) {
+    {
+        auto &cache = app_info_cache();
+        std::lock_guard<std::mutex> lock(cache.mutex);
+        const auto it = cache.install_size.find(title_id);
+        if (it != cache.install_size.end())
+            return it->second;
+    }
+
+    if (!fs::exists(app_path))
+        return 0;
+
+    uint64_t size = 0;
+    try {
+        for (const auto &entry : fs::recursive_directory_iterator(app_path, fs::directory_options::skip_permission_denied)) {
+            boost::system::error_code error;
+            if (entry.is_regular_file(error)) {
+                const auto file_size = fs::file_size(entry.path(), error);
+                if (!error)
+                    size += file_size;
+            }
+        }
+    } catch (const std::exception &exception) {
+        LOG_WARN("Failed to compute install size for {}: {}", title_id, exception.what());
+    }
+
+    auto &cache = app_info_cache();
+    std::lock_guard<std::mutex> lock(cache.mutex);
+    cache.install_size[title_id] = size;
+    return size;
 }
 
 std::optional<app::AppEntry> find_app_by_title_id(const std::string &title_id) {
@@ -178,14 +379,7 @@ std::optional<app::AppEntry> find_app_by_title_id(const std::string &title_id) {
     if (!emuenv)
         return std::nullopt;
 
-    const auto apps = app::get_apps(*emuenv);
-    const auto it = std::find_if(apps.begin(), apps.end(), [&](const app::AppEntry &app) {
-        return app.title_id == title_id;
-    });
-    if (it == apps.end())
-        return std::nullopt;
-
-    return *it;
+    return lookup_app_by_title_id(*emuenv, title_id);
 }
 
 bool remove_path_if_exists(const fs::path &path) {
@@ -207,41 +401,71 @@ uint32_t get_app_action_availability_mask(const std::string &title_id) {
     if (!emuenv)
         return 0;
 
-    uint32_t mask = 0;
-    const auto app = find_app_by_title_id(title_id);
-    const bool has_app = app.has_value();
+    // Everything except the delete-app bit is a pure filesystem question, so it is cached
+    // and paid once per title id. ACTION_DELETE_APPLICATION is not: it also depends on
+    // whether a session is running, and starting or stopping a game does not invalidate
+    // this cache, so that single bit is recomputed on every call instead.
+    const bool session_active = controller && controller->has_active_session();
 
-    if (has_app && (!controller || !controller->has_active_session()))
+    uint32_t cached = 0;
+    bool have_cached = false;
+    {
+        auto &cache = app_info_cache();
+        std::lock_guard<std::mutex> lock(cache.mutex);
+        const auto it = cache.action_mask.find(title_id);
+        if (it != cache.action_mask.end()) {
+            cached = it->second;
+            have_cached = true;
+        }
+    }
+
+    uint32_t mask = cached;
+    if (!have_cached) {
+        const auto app = find_app_by_title_id(title_id);
+        const bool has_app = app.has_value();
+
+        if (has_app && !app->savedata.empty() && fs::exists(emuenv->vita_fs_path / "ux0/user" / emuenv->io.user_id / "savedata" / app->savedata))
+            mask |= ACTION_DELETE_SAVE_DATA;
+
+        if (fs::exists(emuenv->vita_fs_path / "ux0/patch" / title_id)
+            || fs::exists(emuenv->shared_path / "patch" / title_id))
+            mask |= ACTION_DELETE_PATCH;
+
+        if (has_app && !app->addcont.empty() && fs::exists(emuenv->vita_fs_path / "ux0/addcont" / app->addcont))
+            mask |= ACTION_DELETE_DLC;
+
+        if (fs::exists(emuenv->vita_fs_path / "ux0/license" / title_id))
+            mask |= ACTION_DELETE_LICENSE;
+
+        if (fs::exists(emuenv->cache_path / "shaders" / title_id))
+            mask |= ACTION_DELETE_SHADER_CACHE;
+
+        if (fs::exists(emuenv->cache_path / "shaderlog" / title_id)
+            || fs::exists(emuenv->log_path / "shaderlog" / title_id))
+            mask |= ACTION_DELETE_SHADER_LOG;
+
+        if (fs::exists(emuenv->shared_path / "textures/export" / title_id))
+            mask |= ACTION_DELETE_EXPORT_TEXTURES;
+
+        if (fs::exists(emuenv->shared_path / "textures/import" / title_id))
+            mask |= ACTION_DELETE_IMPORT_TEXTURES;
+
+        if (has_app)
+            mask |= ACTION_RESET_LAST_PLAYED;
+    }
+
+    if (!session_active && find_app_by_title_id(title_id).has_value())
         mask |= ACTION_DELETE_APPLICATION;
+    else
+        mask &= ~ACTION_DELETE_APPLICATION;
 
-    if (has_app && !app->savedata.empty() && fs::exists(emuenv->vita_fs_path / "ux0/user" / emuenv->io.user_id / "savedata" / app->savedata))
-        mask |= ACTION_DELETE_SAVE_DATA;
-
-    if (fs::exists(emuenv->vita_fs_path / "ux0/patch" / title_id)
-        || fs::exists(emuenv->shared_path / "patch" / title_id))
-        mask |= ACTION_DELETE_PATCH;
-
-    if (has_app && !app->addcont.empty() && fs::exists(emuenv->vita_fs_path / "ux0/addcont" / app->addcont))
-        mask |= ACTION_DELETE_DLC;
-
-    if (fs::exists(emuenv->vita_fs_path / "ux0/license" / title_id))
-        mask |= ACTION_DELETE_LICENSE;
-
-    if (fs::exists(emuenv->cache_path / "shaders" / title_id))
-        mask |= ACTION_DELETE_SHADER_CACHE;
-
-    if (fs::exists(emuenv->cache_path / "shaderlog" / title_id)
-        || fs::exists(emuenv->log_path / "shaderlog" / title_id))
-        mask |= ACTION_DELETE_SHADER_LOG;
-
-    if (fs::exists(emuenv->shared_path / "textures/export" / title_id))
-        mask |= ACTION_DELETE_EXPORT_TEXTURES;
-
-    if (fs::exists(emuenv->shared_path / "textures/import" / title_id))
-        mask |= ACTION_DELETE_IMPORT_TEXTURES;
-
-    if (has_app)
-        mask |= ACTION_RESET_LAST_PLAYED;
+    if (!have_cached) {
+        // Stored without the session-dependent bit so a cached entry stays valid whether or
+        // not a game happens to be running.
+        auto &cache = app_info_cache();
+        std::lock_guard<std::mutex> lock(cache.mutex);
+        cache.action_mask[title_id] = mask & ~static_cast<uint32_t>(ACTION_DELETE_APPLICATION);
+    }
 
     return mask;
 }

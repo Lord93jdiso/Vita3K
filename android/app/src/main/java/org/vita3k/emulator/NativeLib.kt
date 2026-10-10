@@ -101,6 +101,10 @@ object NativeLib {
     external fun getCustomDriverSupportInfo(customDriverName: String): IntArray
     /** Returns true when the Android custom GPU driver option should be shown on this device. */
     external fun shouldShowCustomDriverOptions(): Boolean
+    /** Returns true when FSR is usable on this device. */
+    external fun isFsrSupported(): Boolean
+    /** Render scale in percent for each FSR preset, or empty when FSR is unavailable. */
+    external fun getFsrRenderScales(): IntArray
     /** Returns the names of the camera devices currently visible to SDL. */
     external fun getAvailableCameras(): Array<String>
     /** Returns a flat array [label0, mask0, label1, mask1, ...] of available ad-hoc addresses. */

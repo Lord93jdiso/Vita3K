@@ -41,6 +41,17 @@ public final class InputOverlay extends SurfaceView implements OnTouchListener
   // wait 10 seconds without inputs before hiding
   private final static int OVERLAY_TIME_BEFORE_HIDE = 10;
 
+  // Decoded overlay artwork keyed by "resId@scale@minDimension". Rebuilding the controls
+  // on a scale or opacity change would otherwise re-decode every drawable on the UI
+  // thread, once per slider step.
+  private final static android.util.LruCache<String, Bitmap> mBitmapCache =
+          new android.util.LruCache<String, Bitmap>(8 * 1024 * 1024) {
+            @Override
+            protected int sizeOf(String key, Bitmap value) {
+              return value.getByteCount();
+            }
+          };
+
   private final Set<InputOverlayDrawableButton> overlayButtons = new HashSet<>();
   private final Set<InputOverlayDrawableDpad> overlayDpads = new HashSet<>();
   private final Set<InputOverlayDrawableJoystick> overlayJoysticks = new HashSet<>();
@@ -70,6 +81,81 @@ public final class InputOverlay extends SurfaceView implements OnTouchListener
   private boolean mShowingOverlay = true;
   // hide overlay manually while keeping the touch utility buttons available
   private boolean mHideOverlayButtons = false;
+
+  /**
+   * Decodes a drawable at its native size, caching it by resource id alone.
+   * <p>
+   * Used for artwork that is later drawn into a rect derived from another bitmap rather than
+   * at the device scale. {@code decodeScaledBitmap} scales relative to the screen's short
+   * edge, so passing it 1 would inflate a ~128px asset to ~1080px on a phone - several
+   * megabytes each, enough to evict both cache entries immediately.
+   *
+   * @param context The current {@link Context}
+   * @param resId   The drawable resource to decode.
+   * @return The cached {@link Bitmap}, or null if the resource could not be decoded.
+   */
+  private static Bitmap decodeCachedBitmap(Context context, int resId)
+  {
+    final String cacheKey = "native@" + resId;
+    final Bitmap cached = mBitmapCache.get(cacheKey);
+    if (cached != null) {
+      return cached;
+    }
+
+    final Bitmap decoded = BitmapFactory.decodeResource(context.getResources(), resId);
+    if (decoded != null) {
+      mBitmapCache.put(cacheKey, decoded);
+    }
+    return decoded;
+  }
+
+  /**
+   * Decodes and scales a drawable, reusing the result for repeated requests.
+   * <p>
+   * The overlay rebuilds every control whenever the scale or opacity setting changes, and
+   * a slider drag fires that dozens of times per second. Without a cache each of those
+   * decodes roughly two dozen PNGs and allocates a full set of scaled bitmaps on the UI
+   * thread, which shows up as visible stutter while dragging.
+   *
+   * @param context The current {@link Context}
+   * @param resId   The drawable resource to decode.
+   * @param scale   The scale factor, relative to the screen's short edge.
+   * @return The scaled {@link Bitmap}
+   */
+  private static Bitmap decodeScaledBitmap(Context context, int resId, float scale)
+  {
+    final Resources res = context.getResources();
+    final DisplayMetrics dm = res.getDisplayMetrics();
+    final int minDimension = Math.min(dm.widthPixels, dm.heightPixels);
+
+    final String cacheKey = resId + "@" + scale + "@" + minDimension;
+    final Bitmap cached = mBitmapCache.get(cacheKey);
+    if (cached != null) {
+      return cached;
+    }
+
+    final Bitmap decoded = BitmapFactory.decodeResource(res, resId);
+    if (decoded == null) {
+      return null;
+    }
+
+    final int maxBitmapDimension = Math.max(decoded.getWidth(), decoded.getHeight());
+    if (maxBitmapDimension <= 0) {
+      return decoded;
+    }
+
+    final float bitmapScale = scale * minDimension / maxBitmapDimension;
+    final Bitmap scaled = Bitmap.createScaledBitmap(decoded,
+            (int) (decoded.getWidth() * bitmapScale),
+            (int) (decoded.getHeight() * bitmapScale),
+            true);
+    if (scaled != decoded) {
+      decoded.recycle();
+    }
+
+    mBitmapCache.put(cacheKey, scaled);
+    return scaled;
+  }
 
   /**
    * Resizes a {@link Bitmap} by a given scale factor
@@ -716,10 +802,8 @@ public final class InputOverlay extends SurfaceView implements OnTouchListener
     scale *= globalScale;
 
     // Initialize the InputOverlayDrawableButton.
-    final Bitmap defaultStateBitmap =
-            resizeBitmap(context, BitmapFactory.decodeResource(res, defaultResId), scale);
-    final Bitmap pressedStateBitmap =
-            resizeBitmap(context, BitmapFactory.decodeResource(res, pressedResId), scale);
+    final Bitmap defaultStateBitmap = decodeScaledBitmap(context, defaultResId, scale);
+    final Bitmap pressedStateBitmap = decodeScaledBitmap(context, pressedResId, scale);
     final InputOverlayDrawableButton overlayDrawable =
             new InputOverlayDrawableButton(res, defaultStateBitmap, pressedStateBitmap, legacyId,
                     control, role);
@@ -781,14 +865,11 @@ public final class InputOverlay extends SurfaceView implements OnTouchListener
     scale *= globalScale;
 
     // Initialize the InputOverlayDrawableDpad.
-    final Bitmap defaultStateBitmap =
-            resizeBitmap(context, BitmapFactory.decodeResource(res, defaultResId), scale);
+    final Bitmap defaultStateBitmap = decodeScaledBitmap(context, defaultResId, scale);
     final Bitmap pressedOneDirectionStateBitmap =
-            resizeBitmap(context, BitmapFactory.decodeResource(res, pressedOneDirectionResId),
-                    scale);
+            decodeScaledBitmap(context, pressedOneDirectionResId, scale);
     final Bitmap pressedTwoDirectionsStateBitmap =
-            resizeBitmap(context, BitmapFactory.decodeResource(res, pressedTwoDirectionsResId),
-                    scale);
+            decodeScaledBitmap(context, pressedTwoDirectionsResId, scale);
     final InputOverlayDrawableDpad overlayDrawable =
             new InputOverlayDrawableDpad(res, defaultStateBitmap,
                     pressedOneDirectionStateBitmap, pressedTwoDirectionsStateBitmap,
@@ -839,10 +920,11 @@ public final class InputOverlay extends SurfaceView implements OnTouchListener
     scale *= globalScale;
 
     // Initialize the InputOverlayDrawableJoystick.
-    final Bitmap bitmapOuter =
-            resizeBitmap(context, BitmapFactory.decodeResource(res, resOuter), scale);
-    final Bitmap bitmapInnerDefault = BitmapFactory.decodeResource(res, defaultResInner);
-    final Bitmap bitmapInnerPressed = BitmapFactory.decodeResource(res, pressedResInner);
+    final Bitmap bitmapOuter = decodeScaledBitmap(context, resOuter, scale);
+    // The inner knob is drawn into innerRect, derived from the outer bitmap's size, so it
+    // keeps its native resolution and must not be scaled to the screen.
+    final Bitmap bitmapInnerDefault = decodeCachedBitmap(context, defaultResInner);
+    final Bitmap bitmapInnerPressed = decodeCachedBitmap(context, pressedResInner);
 
     OverlayPosition position = layout.positionFor(legacyId);
     if (position == null)
