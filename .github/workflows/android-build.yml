@@ -51,6 +51,24 @@ jobs:
           "$VCPKG_LOCAL/bootstrap-vcpkg.sh" -disableMetrics
           echo "VCPKG_ROOT=$VCPKG_LOCAL" >> $GITHUB_ENV
 
+      - name: Describe the NDK toolchain to b2
+        run: |
+          # The project's boost_compile() macro never invoked b2 on Android (it only handled
+          # Windows/Darwin/Linux), and b2 knows nothing about the NDK on its own, so the
+          # toolchain is described here in the form the NDK documents. The "android" variant
+          # is what the CMake side selects as toolset=clang-android.
+          TOOLCHAIN="$ANDROID_NDK_ROOT/toolchains/llvm/prebuilt/linux-x86_64"
+          cat > external/boost/user-config.jam <<EOF
+          using clang : android
+              : "$TOOLCHAIN/bin/aarch64-linux-android${ANDROID_API}-clang++"
+              : <cxxflags>"--sysroot=$TOOLCHAIN/sysroot"
+                <arch>arm
+                <stripmt>true
+                <linker-type>clang
+                ;
+          EOF
+          cat external/boost/user-config.jam
+
       - name: Configure
         env:
           VCPKG_LOCAL: ${{ github.workspace }}/vcpkg

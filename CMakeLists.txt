@@ -149,9 +149,31 @@ macro(boost_compile)
 			WORKING_DIRECTORY ${BOOST_SOURCEDIR}
 			OUTPUT_QUIET
 		)
-	elseif(CMAKE_SYSTEM_NAME STREQUAL "Linux")
+	elseif(CMAKE_SYSTEM_NAME STREQUAL "Linux" OR ANDROID)
+		# Android needs no branch of its own here: it is a Linux target as far as b2 is
+		# concerned. Without this branch b2 was never invoked at all, so no library was
+		# staged and the following find_package failed.
+		set(boost_stage_flags "--ignore-site-config")
+
+if(ANDROID)
+			# b2 knows nothing about the NDK, so the toolchain has to be described to it in a
+			# user-config.jam. The file cannot be produced here: jam needs its newlines as the
+			# two-character escape \n, and CMake turns a real newline into an actual line
+			# break, which jam then reads as a blank line between properties. The workflow
+			# writes this file before configuring, and this only checks that it arrived.
+			if(NOT EXISTS "${BOOST_SOURCEDIR}/user-config.jam")
+				message(FATAL_ERROR
+"Boost for Android needs a user-config.jam describing the NDK toolchain in ${BOOST_SOURCEDIR}.\n"
+"Create it with the clang++ wrapper and the NDK sysroot before configuring.")
+			endif()
+			# The variant name below must match the "using clang : <variant>" line that the
+			# workflow writes: b2 exposes it as clang-<variant>.
+			set(BOOST_TOOLSET "clang-android")
+			message(STATUS "Boost: using user-config.jam (${BOOST_TOOLSET}) for ${ANDROID_ABI}")
+		endif()
+
 		execute_process(
-			COMMAND ${b2_cmd_line_common} --ignore-site-config toolset=${BOOST_TOOLSET} stage
+			COMMAND ${b2_cmd_line_common} ${boost_stage_flags} toolset=${BOOST_TOOLSET} stage
 			WORKING_DIRECTORY ${BOOST_SOURCEDIR}
 			OUTPUT_QUIET
 		)
