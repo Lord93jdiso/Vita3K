@@ -156,9 +156,10 @@ macro(boost_compile)
 		set(boost_stage_flags "--ignore-site-config")
 
 if(ANDROID)
-			# b2 parses the second field of "using clang : <version> ..." as a *version* and
-			# rejects anything that is not a number, so the variant must end in the API level,
-			# the way the NDK documentation spells it.
+			# b2 parses the second field of "using clang : <version> ..." as a version and
+			# rejects anything non-numeric, and per its documentation the dash cannot be used
+			# in that field at all - the tilde is the delimiter for variants. The version is
+			# therefore just the API level, and the target triple carries the architecture.
 			if(NOT ANDROID_PLATFORM_LEVEL)
 				string(REGEX MATCH "android-([0-9]+)" _unused "${ANDROID_PLATFORM}")
 				set(ANDROID_PLATFORM_LEVEL "${CMAKE_MATCH_1}")
@@ -167,26 +168,19 @@ if(ANDROID)
 				message(FATAL_ERROR "Cannot determine the Android API level: ANDROID_PLATFORM='${ANDROID_PLATFORM}'")
 			endif()
 
-			set(boost_android_cxxflags "--sysroot=${ANDROID_NDK_HOME}/toolchains/llvm/prebuilt/linux-x86_64/sysroot")
-			if(ANDROID_ABI STREQUAL "armeabi-v7a")
-				set(boost_android_arch "armv7")
-			elseif(ANDROID_ABI STREQUAL "x86" OR ANDROID_ABI STREQUAL "x86_64")
-				set(boost_android_arch "x86")
-			else()
-				set(boost_android_arch "arm")
-			endif()
-
-			set(BOOST_TOOLCHAIN_BIN "${ANDROID_NDK_HOME}/toolchains/llvm/prebuilt/linux-x86_64/bin")
+			set(boost_android_cxxflags "--sysroot=${ANDROID_NDK_HOME}/toolchains/llvm/prebuilt/linux-x86_64/sysroot -fPIC")
 			set(boost_android_triple "aarch64-linux-android")
 			if(ANDROID_ABI STREQUAL "armeabi-v7a")
 				set(boost_android_triple "armv7a-linux-androideabi")
+				set(boost_android_target_os "android")
 			elseif(ANDROID_ABI STREQUAL "x86" OR ANDROID_ABI STREQUAL "x86_64")
 				set(boost_android_triple "${ANDROID_ABI}-linux-android")
 			endif()
 
-			set(BOOST_ANDROID_VARIANT "${boost_android_arch}-linux-androideabi-${ANDROID_PLATFORM_LEVEL}")
+			set(BOOST_TOOLCHAIN_BIN "${ANDROID_NDK_HOME}/toolchains/llvm/prebuilt/linux-x86_64/bin")
+			set(BOOST_ANDROID_VARIANT "${ANDROID_PLATFORM_LEVEL}~android")
 			file(WRITE "${BOOST_SOURCEDIR}/user-config.jam"
-"using clang : ${BOOST_ANDROID_VARIANT} : ${BOOST_TOOLCHAIN_BIN}/${boost_android_triple}${ANDROID_PLATFORM_LEVEL}-clang++ : <cxxflags>\"${boost_android_cxxflags}\" <arch>${boost_android_arch} <stripmt>true <linker-type>clang ;\n")
+"using clang : ${BOOST_ANDROID_VARIANT} : ${BOOST_TOOLCHAIN_BIN}/${boost_android_triple}${ANDROID_PLATFORM_LEVEL}-clang++ : <cxxflags>\"${boost_android_cxxflags}\" <arch>arm <stripmt>true <linker-type>clang ;\n")
 			message(STATUS "Boost: wrote user-config.jam (${BOOST_ANDROID_VARIANT}) for ${ANDROID_ABI}")
 			set(BOOST_TOOLSET "clang-${BOOST_ANDROID_VARIANT}")
 		endif()
@@ -194,6 +188,7 @@ if(ANDROID)
 		# Not silenced on Android: a toolset b2 cannot resolve produces no output and no
 		# libraries, and the failure only shows up much later as a missing Boost.
 		if(ANDROID)
+			set(boost_stage_flags "${boost_stage_flags} --without-python")
 			execute_process(
 				COMMAND ${b2_cmd_line_common} ${boost_stage_flags} toolset=${BOOST_TOOLSET} stage
 				WORKING_DIRECTORY ${BOOST_SOURCEDIR}
