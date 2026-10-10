@@ -42,6 +42,7 @@
 #include <chrono>
 #include <cstdio>
 #include <cstring>
+#include <jni.h>
 #include <mutex>
 #include <optional>
 #include <string>
@@ -237,6 +238,77 @@ private:
 
 } // namespace
 
+// JNI handles resolved once per process: the SDL activity reference is owned by SDL, so it
+// must never be passed to DeleteLocalRef, and the string-based method lookups it replaces ran
+// on every call. Defined at file scope because C++ does not allow a function definition
+// inside another one, which is where this first landed.
+struct AndroidActivityJni {
+    std::mutex mutex;
+    jclass clazz = nullptr;
+    jmethodID open_pause_menu = nullptr;
+    jmethodID set_current_game_id = nullptr;
+    jmethodID get_display_rotation = nullptr;
+};
+
+AndroidActivityJni &activity_jni() {
+    static AndroidActivityJni cache;
+    return cache;
+}
+
+bool ensure_activity_jni(JNIEnv *jni_env, jobject activity) {
+    auto &cache = activity_jni();
+    {
+        std::lock_guard<std::mutex> lock(cache.mutex);
+        if (cache.clazz)
+            return true;
+    }
+
+    jclass local_clazz = jni_env->GetObjectClass(activity);
+    if (!local_clazz)
+        return false;
+
+    jmethodID open_pause_menu = jni_env->GetMethodID(local_clazz, "openPauseMenuFromController", "()V");
+    jmethodID set_current_game_id = jni_env->GetMethodID(local_clazz, "setCurrentGameId", "(Ljava/lang/String;)V");
+    jmethodID get_display_rotation = jni_env->GetMethodID(local_clazz, "getNativeDisplayRotation", "()I");
+
+    // A global ref survives across threads; it is released again when the activity is
+    // destroyed, otherwise every session restart would leak one.
+    jclass global_clazz = reinterpret_cast<jclass>(jni_env->NewGlobalRef(local_clazz));
+    jni_env->DeleteLocalRef(local_clazz);
+
+    std::lock_guard<std::mutex> lock(cache.mutex);
+    if (cache.clazz) {
+        // Another thread resolved it first; keep its result and drop ours.
+        if (global_clazz)
+            jni_env->DeleteGlobalRef(global_clazz);
+        return true;
+    }
+
+    cache.open_pause_menu = open_pause_menu;
+    cache.set_current_game_id = set_current_game_id;
+    cache.get_display_rotation = get_display_rotation;
+    cache.clazz = global_clazz;
+
+    return cache.clazz != nullptr;
+}
+
+void invalidate_activity_jni() {
+    auto &cache = activity_jni();
+    jclass stale = nullptr;
+    {
+        std::lock_guard<std::mutex> lock(cache.mutex);
+        stale = cache.clazz;
+        cache.clazz = nullptr;
+        cache.open_pause_menu = nullptr;
+        cache.set_current_game_id = nullptr;
+        cache.get_display_rotation = nullptr;
+    }
+
+    JNIEnv *jni_env = reinterpret_cast<JNIEnv *>(SDL_GetAndroidJNIEnv());
+    if (jni_env && stale)
+        jni_env->DeleteGlobalRef(stale);
+}
+
 extern "C" {
 
 // SDL3 entry point — called by SDLActivity's native thread when the Emulator activity starts.
@@ -264,75 +336,6 @@ SDLMAIN_DECLSPEC int SDL_main(int argc, char *argv[]) {
     if (!session_controller) {
         LOG_ERROR("App session controller is unavailable");
         return -1;
-    }
-
-    // JNI handles resolved once per process: the SDL activity reference is owned by SDL,
-    // so it must never be passed to DeleteLocalRef, and string-based method lookups on
-    // every call are pure overhead.
-    struct AndroidActivityJni {
-        std::mutex mutex;
-        jclass clazz = nullptr;
-        jmethodID open_pause_menu = nullptr;
-        jmethodID set_current_game_id = nullptr;
-        jmethodID get_display_rotation = nullptr;
-    };
-
-    AndroidActivityJni &activity_jni() {
-        static AndroidActivityJni cache;
-        return cache;
-    }
-
-    bool ensure_activity_jni(JNIEnv * jni_env, jobject activity) {
-        auto &cache = activity_jni();
-        {
-            std::lock_guard<std::mutex> lock(cache.mutex);
-            if (cache.clazz)
-                return true;
-        }
-
-        jclass local_clazz = jni_env->GetObjectClass(activity);
-        if (!local_clazz)
-            return false;
-
-        jmethodID open_pause_menu = jni_env->GetMethodID(local_clazz, "openPauseMenuFromController", "()V");
-        jmethodID set_current_game_id = jni_env->GetMethodID(local_clazz, "setCurrentGameId", "(Ljava/lang/String;)V");
-        jmethodID get_display_rotation = jni_env->GetMethodID(local_clazz, "getNativeDisplayRotation", "()I");
-
-        // A global ref survives across threads; it is released again when the activity is
-        // destroyed, otherwise every session restart would leak one.
-        jclass global_clazz = reinterpret_cast<jclass>(jni_env->NewGlobalRef(local_clazz));
-        jni_env->DeleteLocalRef(local_clazz);
-
-        std::lock_guard<std::mutex> lock(cache.mutex);
-        if (cache.clazz) {
-            if (global_clazz)
-                jni_env->DeleteGlobalRef(global_clazz);
-            return true;
-        }
-
-        cache.open_pause_menu = open_pause_menu;
-        cache.set_current_game_id = set_current_game_id;
-        cache.get_display_rotation = get_display_rotation;
-        cache.clazz = global_clazz;
-
-        return cache.clazz != nullptr;
-    }
-
-    void invalidate_activity_jni() {
-        auto &cache = activity_jni();
-        jclass stale = nullptr;
-        {
-            std::lock_guard<std::mutex> lock(cache.mutex);
-            stale = cache.clazz;
-            cache.clazz = nullptr;
-            cache.open_pause_menu = nullptr;
-            cache.set_current_game_id = nullptr;
-            cache.get_display_rotation = nullptr;
-        }
-
-        JNIEnv *jni_env = reinterpret_cast<JNIEnv *>(SDL_GetAndroidJNIEnv());
-        if (jni_env && stale)
-            jni_env->DeleteGlobalRef(stale);
     }
 
     const auto open_pause_menu = []() {
