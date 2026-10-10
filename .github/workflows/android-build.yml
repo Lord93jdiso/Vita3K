@@ -51,24 +51,38 @@ jobs:
           "$VCPKG_LOCAL/bootstrap-vcpkg.sh" -disableMetrics
           echo "VCPKG_ROOT=$VCPKG_LOCAL" >> $GITHUB_ENV
 
+      - name: Install vcpkg dependencies for Android
+        env:
+          VCPKG_LOCAL: ${{ github.workspace }}/vcpkg
+        run: |
+          # Boost is installed by vcpkg (it is already listed in vcpkg.json) rather than
+          # built from external/boost: the project's boost_compile() macro has no Android
+          # branch and invokes b2 nowhere, so a source build silently produces nothing.
+          export VCPKG_ROOT="$VCPKG_LOCAL"
+          export ANDROID_NDK_ROOT
+          export VCPKG_INSTALLED_DIR="$GITHUB_WORKSPACE/vcpkg_installed"
+          export VCPKG_BINARY_SOURCES="clear;x-gha,readwrite"
+          "$VCPKG_LOCAL/vcpkg" install --triplet arm64-android
+          ls "$VCPKG_INSTALLED_DIR/arm64-android/lib" | head
+
       - name: Configure
         env:
           VCPKG_LOCAL: ${{ github.workspace }}/vcpkg
         run: |
-          # The Android toolchain has to be the *primary* toolchain, not something chained
-          # behind vcpkg: cmake/vcpkg_android.cmake includes itself at the top of the root
-          # CMakeLists.txt, before project(), and the NDK toolchain is what sets
-          # CMAKE_SYSTEM_NAME to Android and picks the cross compiler. Passing vcpkg's
-          # toolchain as primary and chaining the NDK one leaves the host compiler in place
-          # and the build silently configures for Linux.
+          # The Android toolchain has to be the *primary* toolchain: it is what sets
+          # CMAKE_SYSTEM_NAME to Android and picks the cross compiler. Chaining it behind
+          # vcpkg's toolchain left the host compiler in place, and the build configured for
+          # Linux with SDL then asking for X11.
           export ANDROID_NDK_HOME="$ANDROID_NDK_ROOT"
           export VCPKG_ROOT="$VCPKG_LOCAL"
-          export VCPKG_CHAINLOAD_TOOLCHAIN_FILE="$ANDROID_NDK_ROOT/build/cmake/android.toolchain.cmake"
+          export VCPKG_INSTALLED_DIR="$GITHUB_WORKSPACE/vcpkg_installed"
           cmake -B build-android -G Ninja \
             -DCMAKE_TOOLCHAIN_FILE="$ANDROID_NDK_ROOT/build/cmake/android.toolchain.cmake" \
             -DCMAKE_BUILD_TYPE=Release \
             -DANDROID_ABI=arm64-v8a \
-            -DANDROID_PLATFORM=android-${ANDROID_API}
+            -DANDROID_PLATFORM=android-${ANDROID_API} \
+            -DCMAKE_PREFIX_PATH="$VCPKG_INSTALLED_DIR/arm64-android" \
+            -DCMAKE_FIND_ROOT_PATH="$VCPKG_INSTALLED_DIR/arm64-android;$ANDROID_NDK_ROOT/toolchains/llvm/prebuilt/linux-x86_64/sysroot"
 
       - name: Build
         run: cmake --build build-android --target vita3k --config Release
