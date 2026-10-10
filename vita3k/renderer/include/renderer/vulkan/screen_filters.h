@@ -160,5 +160,4 @@ public:
     }
 };
 
-
 } // namespace renderer::vulkan

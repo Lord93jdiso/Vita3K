@@ -914,8 +914,8 @@ bool VKState::create(std::unique_ptr<renderer::State> &state, const Config &conf
     }
 
     // The fragment-shader FSR reads the frame through the ordinary screen-filter sampler and
-// never writes the swapchain as a storage image, so it does not need eStorage surface usage
-// - which is what used to disqualify it on drivers that only offered transfer usage.
+    // never writes the swapchain as a storage image, so it does not need eStorage surface usage
+    // - which is what used to disqualify it on drivers that only offered transfer usage.
     support_fsr = true;
 
     return true;

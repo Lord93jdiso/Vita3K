@@ -443,5 +443,4 @@ vk::Sampler FXAAScreenFilter::create_sampler() {
     return screen.state.device.createSampler(sampler_info);
 }
 
-
 } // namespace renderer::vulkan
