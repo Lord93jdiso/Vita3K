@@ -39,17 +39,25 @@ jobs:
           sdkmanager "platform-tools" "platforms;android-${ANDROID_API}" "ndk;${NDK_VERSION}"
 
       - name: Set up vcpkg
+        env:
+          VCPKG_LOCAL: ${{ github.workspace }}/vcpkg
         run: |
-          git clone https://github.com/microsoft/vcpkg.git $VCPKG_ROOT
-          $VCPKG_ROOT/bootstrap-vcpkg.sh -disableMetrics
+          # VCPKG_ROOT is not set at this point - it is only exported to later steps - so the
+          # clone target has to be spelled out here.
+          git clone https://github.com/microsoft/vcpkg.git "$VCPKG_LOCAL"
+          "$VCPKG_LOCAL/bootstrap-vcpkg.sh" -disableMetrics
+          echo "VCPKG_ROOT=$VCPKG_LOCAL" >> $GITHUB_ENV
 
       - name: Configure
+        env:
+          VCPKG_LOCAL: ${{ github.workspace }}/vcpkg
         run: |
-          # cmake/vcpkg_android.cmake resolves both from the environment, so they have to
-          # point at the real locations on this runner rather than being guessed.
-          echo "ANDROID_NDK_HOME=$ANDROID_NDK_ROOT" >> $GITHUB_ENV
-          echo "VCPKG_ROOT=$VCPKG_INSTALLATION_ROOT" >> $GITHUB_ENV
-          echo "VCPKG_BINARY_SOURCES=clear;x-gha,readwrite" >> $GITHUB_ENV
+          # cmake/vcpkg_android.cmake reads ANDROID_NDK_HOME and VCPKG_ROOT from the
+          # environment of the cmake process itself. $GITHUB_ENV only affects *later* steps,
+          # so they are exported here as well - VCPKG_ROOT already points at the clone from
+          # the previous step.
+          export ANDROID_NDK_HOME="$ANDROID_NDK_ROOT"
+          export VCPKG_ROOT="$VCPKG_LOCAL"
           cmake -B build-android -G Ninja \
             -DCMAKE_TOOLCHAIN_FILE=cmake/vcpkg_android.cmake \
             -DCMAKE_BUILD_TYPE=Release \
