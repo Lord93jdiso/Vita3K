@@ -156,26 +156,39 @@ macro(boost_compile)
 		set(boost_stage_flags "--ignore-site-config")
 
 if(ANDROID)
-			# The property list is passed as one argument, so it cannot be assembled from
-			# separate CMake variables: CMake would insert unescaped semicolons and the
-			# property separators would be read as a literal. This is deliberately brittle.
+			# b2 parses the second field of "using clang : <version> ..." as a *version* and
+			# rejects anything that is not a number, so the variant must end in the API level,
+			# the way the NDK documentation spells it.
+			if(NOT ANDROID_PLATFORM_LEVEL)
+				string(REGEX MATCH "android-([0-9]+)" _unused "${ANDROID_PLATFORM}")
+				set(ANDROID_PLATFORM_LEVEL "${CMAKE_MATCH_1}")
+			endif()
+			if(NOT ANDROID_PLATFORM_LEVEL)
+				message(FATAL_ERROR "Cannot determine the Android API level: ANDROID_PLATFORM='${ANDROID_PLATFORM}'")
+			endif()
+
 			set(boost_android_cxxflags "--sysroot=${ANDROID_NDK_HOME}/toolchains/llvm/prebuilt/linux-x86_64/sysroot")
-			set(boost_android_abi_prefix "aarch64-linux-android")
 			if(ANDROID_ABI STREQUAL "armeabi-v7a")
-				set(boost_android_arch "arm")
-				set(boost_android_abi_prefix "armv7a-linux-androideabi")
+				set(boost_android_arch "armv7")
 			elseif(ANDROID_ABI STREQUAL "x86" OR ANDROID_ABI STREQUAL "x86_64")
 				set(boost_android_arch "x86")
-				set(boost_android_abi_prefix "${ANDROID_ABI}-linux-android")
 			else()
 				set(boost_android_arch "arm")
 			endif()
 
 			set(BOOST_TOOLCHAIN_BIN "${ANDROID_NDK_HOME}/toolchains/llvm/prebuilt/linux-x86_64/bin")
+			set(boost_android_triple "aarch64-linux-android")
+			if(ANDROID_ABI STREQUAL "armeabi-v7a")
+				set(boost_android_triple "armv7a-linux-androideabi")
+			elseif(ANDROID_ABI STREQUAL "x86" OR ANDROID_ABI STREQUAL "x86_64")
+				set(boost_android_triple "${ANDROID_ABI}-linux-android")
+			endif()
+
+			set(BOOST_ANDROID_VARIANT "${boost_android_arch}-linux-androideabi-${ANDROID_PLATFORM_LEVEL}")
 			file(WRITE "${BOOST_SOURCEDIR}/user-config.jam"
-"using clang : ${boost_android_arch}-android : ${BOOST_TOOLCHAIN_BIN}/${boost_android_abi_prefix}${ANDROID_API}-clang++ : <cxxflags>\"${boost_android_cxxflags}\" <arch>${boost_android_arch} <stripmt>true <linker-type>clang ;\n")
-			message(STATUS "Boost: wrote user-config.jam (${boost_android_arch}-android) for ${ANDROID_ABI}")
-			set(BOOST_TOOLSET "clang-${boost_android_arch}-android")
+"using clang : ${BOOST_ANDROID_VARIANT} : ${BOOST_TOOLCHAIN_BIN}/${boost_android_triple}${ANDROID_PLATFORM_LEVEL}-clang++ : <cxxflags>\"${boost_android_cxxflags}\" <arch>${boost_android_arch} <stripmt>true <linker-type>clang ;\n")
+			message(STATUS "Boost: wrote user-config.jam (${BOOST_ANDROID_VARIANT}) for ${ANDROID_ABI}")
+			set(BOOST_TOOLSET "clang-${BOOST_ANDROID_VARIANT}")
 		endif()
 
 		# Not silenced on Android: a toolset b2 cannot resolve produces no output and no
