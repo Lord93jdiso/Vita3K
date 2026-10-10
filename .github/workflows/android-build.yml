@@ -29,6 +29,10 @@ jobs:
 
       - name: Set up the Android SDK and NDK
         uses: android-actions/setup-android@v3
+        with:
+          # The action installs "tools" by default, which no longer exists in the SDK
+          # repository and makes the step fail before it gets to the NDK.
+          packages: ''
 
       - name: Install SDK packages
         run: |
