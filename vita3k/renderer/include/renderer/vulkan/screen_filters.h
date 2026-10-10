@@ -49,11 +49,14 @@ private:
     vk::DescriptorSetLayout descriptor_set_layout;
     std::vector<vk::DescriptorSet> descriptor_sets;
     vk::DescriptorPool descriptor_pool;
-    vk::PipelineLayout pipeline_layout;
     vk::Pipeline pipeline;
 
     vkutil::Buffer vao;
     std::vector<std::array<float, 4>> last_uvs;
+
+protected:
+    // write_push_constants() overrides push into this, so it cannot stay private.
+    vk::PipelineLayout pipeline_layout;
 
     vk::ShaderModule vertex_shader;
     vk::ShaderModule fragment_shader;
