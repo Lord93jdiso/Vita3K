@@ -484,6 +484,11 @@
     <string name="settings_system_enter_button_desc">Select which button acts as the Enter/Confirm button. Some apps ignore this setting.</string>
     <string name="settings_system_enter_circle">Circle</string>
     <string name="settings_system_enter_cross">Cross</string>
+    <string name="settings_system_storage">Storage location</string>
+    <string name="settings_system_storage_desc">Where installed games, firmware and shader caches are stored. Detected card: %1$s. Applies the next time Vita3K starts; already installed games stay where they are.</string>
+    <string name="settings_system_storage_location">Install games on</string>
+    <string name="settings_system_storage_sd">SD card</string>
+    <string name="settings_system_storage_internal">Internal storage</string>
     <string name="settings_system_pstv_mode">PlayStation TV Mode (PSTV)</string>
     <string name="settings_system_pstv_mode_desc">Enable PlayStation TV mode.</string>
     <string name="settings_system_show_mode">Show Mode</string>

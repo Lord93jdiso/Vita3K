@@ -30,10 +30,12 @@ import androidx.compose.ui.Modifier
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.res.stringResource
 import androidx.compose.ui.text.style.TextOverflow
+import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.unit.dp
 import org.vita3k.emulator.R
 import org.vita3k.emulator.ConnectedGamepad
 import org.vita3k.emulator.NativeLib
+import org.vita3k.emulator.data.AppStorage
 import org.vita3k.emulator.data.CustomDriverLoadStatus
 import org.vita3k.emulator.data.EmulatorConfig
 import org.vita3k.emulator.data.FirmwareLinks
@@ -1222,6 +1224,40 @@ private fun SystemSettingsSection(
     onUpdate: (EmulatorConfig.() -> Unit) -> Unit,
     onShowHelp: (SettingsHelpEntry) -> Unit
 ) {
+    // Offered only when a removable volume is present, since there would otherwise be
+    // nothing to choose between. Applies on the next launch - the path is resolved once,
+    // when the native side is initialised.
+    if (!isPerApp) {
+        val context = LocalContext.current
+        val secondaryPath = remember(context) { AppStorage.secondaryStoragePath(context) }
+        if (secondaryPath != null) {
+            val selected = AppStorage.storageVolumePreference(context)
+            val options = listOf(
+                stringResource(R.string.settings_system_storage_sd) to AppStorage.VOLUME_EXTERNAL,
+                stringResource(R.string.settings_system_storage_internal) to AppStorage.VOLUME_INTERNAL
+            )
+            SettingsSectionCard(
+                title = stringResource(R.string.settings_system_storage),
+                summary = null,
+                help = SettingsHelpEntry(
+                    title = stringResource(R.string.settings_system_storage),
+                    body = stringResource(R.string.settings_system_storage_desc, secondaryPath)
+                ),
+                onShowHelp = onShowHelp
+            ) {
+                SettingsChoiceField(
+                    title = stringResource(R.string.settings_system_storage_location),
+                    options = options.map { it.first },
+                    selectedIndex = options.indexOfFirst { it.second == selected }.coerceAtLeast(0),
+                    onSelect = { index ->
+                        options.getOrNull(index)?.second?.let { AppStorage.setStorageVolumePreference(context, it) }
+                    },
+                    onShowHelp = onShowHelp
+                )
+            }
+        }
+    }
+
     SettingsSectionCard(title = stringResource(R.string.settings_system_console_settings), summary = null, help = null, onShowHelp = onShowHelp) {
         SettingsToggleRow(
             title = stringResource(R.string.settings_system_pstv_mode),
